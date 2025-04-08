@@ -1,5 +1,8 @@
+#define VK_USE_PLATFORM_WIN32_KHR
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
+#define GLFW_EXPOSE_NATIVE_WIN32
+#include <GLFW/glfw3native.h>
 
 #include <cstdint>
 #include <cstdio>
@@ -99,7 +102,7 @@ static void InitDebugCallback(VkInstance Instance)
 																										"vkCreateDebugUtilsMessengerEXT");
 	if (Func)
 	{
-		Func(Instance, &CreateInfo, nullptr, &s_DebugHandle);
+		Func(Instance, &CreateInfo, nullptr, &s_DebugHandle); // pAllocator
 	}
 	else
 	{
@@ -114,7 +117,7 @@ static void DestroyDebugCallback(VkInstance Instance)
 																										  "vkDestroyDebugUtilsMessengerEXT");
 	if (Func)
 	{
-		Func(Instance, s_DebugHandle, nullptr);
+		Func(Instance, s_DebugHandle, nullptr); // pAllocator
 	}
 }
 
@@ -150,13 +153,21 @@ static b32 AreValidationLayersSupported()
 }
 #endif
 
+enum queue_family_flags : u32
+{
+	QueueFamily_Graphics = 1,
+	QueueFamily_Present  = 1 << 1
+};
+
 struct queue_family_indices
 {
 	u32 GraphicsFamily;
-	b32 GraphicsFamilyValid;
+	u32 PresentFamily;
+	u32 ValidFlags;
 };
 
-queue_family_indices FindQueueFamilies(VkPhysicalDevice Device)
+// TODO: Don't we just want to find the one queue that supports both graphics and presenting, and save some hassle?
+queue_family_indices FindQueueFamilies(VkPhysicalDevice Device, VkSurfaceKHR Surface)
 {
 	queue_family_indices Result = {};
 
@@ -176,8 +187,23 @@ queue_family_indices FindQueueFamilies(VkPhysicalDevice Device)
 			if (QueueFamilies[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)
 			{
 				Result.GraphicsFamily = i;
-				Result.GraphicsFamilyValid = true;
+				Result.ValidFlags |= QueueFamily_Graphics;
+			}
+
+			b32 HasPresentSupport = false;
+			vkGetPhysicalDeviceSurfaceSupportKHR(Device, i, Surface, &HasPresentSupport);
+			if (HasPresentSupport)
+			{
+				Result.PresentFamily = i;
+				Result.ValidFlags |= QueueFamily_Present;
+			}
+			if ((Result.ValidFlags & QueueFamily_Present) && (Result.ValidFlags & QueueFamily_Graphics))
+			{
 				break;
+			}
+			else
+			{
+				Result = {};
 			}
 		}
 		free(QueueFamilies);
@@ -189,7 +215,7 @@ static u32 RateDeviceSuitability(VkPhysicalDevice Device, queue_family_indices Q
 {
 	u32 Score = 0;
 
-	if (QueueFamilyBois.GraphicsFamilyValid)
+	if ((QueueFamilyBois.ValidFlags & QueueFamily_Graphics) && (QueueFamilyBois.ValidFlags & QueueFamily_Present))
 	{
 		VkPhysicalDeviceProperties DeviceProps;
 		vkGetPhysicalDeviceProperties(Device, &DeviceProps);
@@ -210,7 +236,7 @@ struct physical_device_deets
 	queue_family_indices QueueFamilyIndices;
 };
 
-static physical_device_deets PickPhysicalDevice(VkInstance Instance)
+static physical_device_deets PickPhysicalDevice(VkInstance Instance, VkSurfaceKHR Surface)
 {
 	physical_device_deets Result = {};
 
@@ -228,7 +254,7 @@ static physical_device_deets PickPhysicalDevice(VkInstance Instance)
 		u32 HighestScore = 0;
 		for (u32 i = 0; i < NumDevices; i++)
 		{
-			queue_family_indices QueueFamilyIndices = FindQueueFamilies(Devices[i]);
+			queue_family_indices QueueFamilyIndices = FindQueueFamilies(Devices[i], Surface);
 			u32 Score = RateDeviceSuitability(Devices[i], QueueFamilyIndices);
 			if (Score > HighestScore)
 			{
@@ -238,6 +264,7 @@ static physical_device_deets PickPhysicalDevice(VkInstance Instance)
 		}
 		if (!Result.Device)
 		{
+			Assert(false);
 			fprintf(stderr, "Failed to find suitable GPU - they're all shit!\n");
 		}
 		free(Devices);
@@ -308,7 +335,7 @@ static VkInstance CreateInstance()
 		CreateInfo.pNext = &DebugCreateInfo;
 #endif
 
-		if (vkCreateInstance(&CreateInfo, nullptr, &Instance) != VK_SUCCESS)
+		if (vkCreateInstance(&CreateInfo, nullptr, &Instance) != VK_SUCCESS) // pAllocator
 		{
 			fprintf(stderr, "ERROR: Failed to create Vulkan instance\n");
 		}
@@ -324,11 +351,19 @@ static VkInstance CreateInstance()
 	return Instance;
 }
 
+struct logical_device
+{
+	VkDevice Device;
+	VkQueue PresentQueue;
+};
+
 static VkDevice CreateLogicalDevice(physical_device_deets DeviceDeets)
 {
-	Assert(DeviceDeets.QueueFamilyIndices.GraphicsFamilyValid);
+	Assert((DeviceDeets.QueueFamilyIndices.ValidFlags & QueueFamily_Graphics) && (DeviceDeets.QueueFamilyIndices.ValidFlags & QueueFamily_Present));
+	// TODO: Oink oink
+	Assert(DeviceDeets.QueueFamilyIndices.GraphicsFamily == DeviceDeets.QueueFamilyIndices.PresentFamily);
 
-	VkPhysicalDeviceFeatures DeviceFeatures = {};
+	VkPhysicalDeviceFeatures DeviceFeatures = {}; // Apparently we're going to modify this later...
 
 	f32 QueuePriority = 1.0f;
 	VkDeviceQueueCreateInfo QueueCreateInfo
@@ -351,10 +386,28 @@ static VkDevice CreateLogicalDevice(physical_device_deets DeviceDeets)
 	DeviceCreateInfo.ppEnabledLayerNames = VALIDATION_LAYERS;
 #endif
 	VkDevice Result = VK_NULL_HANDLE;
-	if (vkCreateDevice(DeviceDeets.Device, &DeviceCreateInfo, nullptr, &Result) != VK_SUCCESS)
+	if (vkCreateDevice(DeviceDeets.Device, &DeviceCreateInfo, nullptr, &Result) != VK_SUCCESS) // pAllocator
 	{
 		Assert(false);
 		fprintf(stderr, "Failed to create logical device!\n");
+	}
+	return Result;
+}
+
+static VkSurfaceKHR CreateSurface(VkInstance Instance, GLFWwindow* Window)
+{
+	VkWin32SurfaceCreateInfoKHR CreateInfo
+	{
+		.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR,
+		.hinstance = GetModuleHandle(nullptr),
+		.hwnd = glfwGetWin32Window(Window),
+	};
+
+	VkSurfaceKHR Result = VK_NULL_HANDLE;
+	if (vkCreateWin32SurfaceKHR(Instance, &CreateInfo, nullptr, &Result) != VK_SUCCESS) // pAllocator
+	{
+		Assert(false);
+		fprintf(stderr, "Couldn't make a Win32 surface, bro\n");
 	}
 	return Result;
 }
@@ -363,15 +416,17 @@ struct vulkan_stuff
 {
 	VkInstance Instance;
 	VkDevice Device;
+	VkSurfaceKHR Surface;
 	VkQueue GraphicsQueue;
 };
 
-static vulkan_stuff InitVulkan()
+static vulkan_stuff InitVulkan(GLFWwindow* Window)
 {
 	vulkan_stuff Result = {};
 
 	Result.Instance = CreateInstance();
-	physical_device_deets PhysicalDevice = PickPhysicalDevice(Result.Instance);
+	Result.Surface = CreateSurface(Result.Instance, Window);
+	physical_device_deets PhysicalDevice = PickPhysicalDevice(Result.Instance, Result.Surface);
 	Result.Device = CreateLogicalDevice(PhysicalDevice);
 	vkGetDeviceQueue(Result.Device, PhysicalDevice.QueueFamilyIndices.GraphicsFamily, 0, &Result.GraphicsQueue);
 
@@ -391,9 +446,9 @@ static void CleanUp(GLFWwindow* Window, vulkan_stuff VulkanStuff)
 #if _DEBUG
 	DestroyDebugCallback(VulkanStuff.Instance);
 #endif
-	vkDestroyDevice(VulkanStuff.Device, nullptr);
-
-	vkDestroyInstance(VulkanStuff.Instance, nullptr);
+	vkDestroyDevice(VulkanStuff.Device, nullptr); // pAllocator
+	vkDestroySurfaceKHR(VulkanStuff.Instance, VulkanStuff.Surface, nullptr); // pAllocator
+	vkDestroyInstance(VulkanStuff.Instance, nullptr); // pAllocator
 	glfwDestroyWindow(Window);
 	glfwTerminate();
 }
@@ -401,7 +456,7 @@ static void CleanUp(GLFWwindow* Window, vulkan_stuff VulkanStuff)
 int main()
 {
 	GLFWwindow* Window = InitWindow();
-	vulkan_stuff VulkanStuff = InitVulkan();
+	vulkan_stuff VulkanStuff = InitVulkan(Window);
 	MainLoop(Window);
 	CleanUp(Window, VulkanStuff);
 }
