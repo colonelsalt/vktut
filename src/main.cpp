@@ -21,6 +21,20 @@ typedef double f64;
 #define ArrayCount(X) (sizeof(X) / sizeof((X)[0]))
 #define Assert(X) if (!(X)) __debugbreak()
 
+static u32 Clamp(u32 Value, u32 Min, u32 Max)
+{
+	u32 Result = Value;
+	if (Value < Min)
+	{
+		Result = Min;
+	}
+	else if (Value > Max)
+	{
+		Result = Max;
+	}
+	return Result;
+}
+
 static GLFWwindow* InitWindow()
 {
 	glfwInit();
@@ -33,6 +47,11 @@ static GLFWwindow* InitWindow()
 static constexpr const char* VALIDATION_LAYERS[] =
 {
 	"VK_LAYER_KHRONOS_validation"
+};
+
+static constexpr const char* DEVICE_EXTENSIONS[] =
+{
+	VK_KHR_SWAPCHAIN_EXTENSION_NAME
 };
 
 struct extensions_list
@@ -153,6 +172,69 @@ static b32 AreValidationLayersSupported()
 }
 #endif
 
+struct swap_chain_deets
+{
+	VkSurfaceCapabilitiesKHR Capabilities;
+	
+	VkSurfaceFormatKHR* Formats;
+	u32 NumFormats;
+
+	VkPresentModeKHR* PresentModes;
+	u32 NumPresentModes;
+};
+
+static swap_chain_deets QuerySwapChainSupport(VkPhysicalDevice Device, VkSurfaceKHR Surface)
+{
+	swap_chain_deets Result = {};
+
+	vkGetPhysicalDeviceSurfaceCapabilitiesKHR(Device, Surface, &Result.Capabilities);
+
+	vkGetPhysicalDeviceSurfaceFormatsKHR(Device, Surface, &Result.NumFormats, nullptr);
+	if (Result.NumFormats != 0)
+	{
+		Result.Formats = AllocArray(VkSurfaceFormatKHR, Result.NumFormats);
+		vkGetPhysicalDeviceSurfaceFormatsKHR(Device, Surface, &Result.NumFormats, Result.Formats);
+		
+		vkGetPhysicalDeviceSurfacePresentModesKHR(Device, Surface, &Result.NumPresentModes, nullptr);
+		if (Result.NumPresentModes == 0)
+		{
+			free(Result.Formats);
+			Result.Formats = nullptr;
+		}
+		else
+		{
+			Result.PresentModes = AllocArray(VkPresentModeKHR, Result.NumPresentModes);
+			vkGetPhysicalDeviceSurfacePresentModesKHR(Device, Surface, &Result.NumPresentModes, Result.PresentModes);
+		}
+	}
+	return Result;
+}
+
+b32 CheckDeviceSupportsExtensions(VkPhysicalDevice Device)
+{
+	u32 NumExtensions = 0;
+	vkEnumerateDeviceExtensionProperties(Device, nullptr, &NumExtensions, nullptr);
+	VkExtensionProperties* AvailableExtensions = AllocArray(VkExtensionProperties, NumExtensions);
+	vkEnumerateDeviceExtensionProperties(Device, nullptr, &NumExtensions, AvailableExtensions);
+	
+	u32 FoundExtensions = 0;
+	for (u32 i = 0; i < ArrayCount(DEVICE_EXTENSIONS); i++)
+	{
+		for (u32 j = 0; j < NumExtensions; j++)
+		{
+			if (strcmp(DEVICE_EXTENSIONS[i], AvailableExtensions[j].extensionName) == 0)
+			{
+				FoundExtensions++;
+				break;
+			}
+		}
+	}
+
+	free(AvailableExtensions);
+	b32 Result = FoundExtensions == ArrayCount(DEVICE_EXTENSIONS);
+	return Result;
+}
+
 enum queue_family_flags : u32
 {
 	QueueFamily_Graphics = 1,
@@ -211,11 +293,15 @@ queue_family_indices FindQueueFamilies(VkPhysicalDevice Device, VkSurfaceKHR Sur
 	return Result;
 }
 
-static u32 RateDeviceSuitability(VkPhysicalDevice Device, queue_family_indices QueueFamilyBois)
+static u32 RateDeviceSuitability(VkPhysicalDevice Device, queue_family_indices QueueFamilyBois, swap_chain_deets* SwapChainDeets)
 {
 	u32 Score = 0;
 
-	if ((QueueFamilyBois.ValidFlags & QueueFamily_Graphics) && (QueueFamilyBois.ValidFlags & QueueFamily_Present))
+	if ((QueueFamilyBois.ValidFlags & QueueFamily_Graphics) && 
+		(QueueFamilyBois.ValidFlags & QueueFamily_Present) &&
+		CheckDeviceSupportsExtensions(Device) &&
+		SwapChainDeets->NumFormats > 0 &&
+		SwapChainDeets->NumPresentModes > 0)
 	{
 		VkPhysicalDeviceProperties DeviceProps;
 		vkGetPhysicalDeviceProperties(Device, &DeviceProps);
@@ -230,10 +316,58 @@ static u32 RateDeviceSuitability(VkPhysicalDevice Device, queue_family_indices Q
 	return Score;
 }
 
+static VkSurfaceFormatKHR ChooseSwapSurfaceFormat(VkSurfaceFormatKHR* Formats, u32 NumFormats)
+{
+	Assert(NumFormats != 0 && Formats);
+	VkSurfaceFormatKHR Result = Formats[0]; // TODO: Pick the 'next best' option instead?
+	for (u32 i = 0; i < NumFormats; i++)
+	{
+		VkSurfaceFormatKHR Format = Formats[i];
+		if (Format.format == VK_FORMAT_B8G8R8_SRGB && Format.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
+		{
+			Result = Format;
+			break;
+		}
+	}
+	return Result;
+}
+
+static VkPresentModeKHR ChooseSwapPresentMode(VkPresentModeKHR* PresentModes, u32 NumPresentModes)
+{
+	Assert(NumPresentModes > 0 && PresentModes);
+	VkPresentModeKHR Result = VK_PRESENT_MODE_FIFO_KHR;
+	for (u32 i = 0; i < NumPresentModes; i++)
+	{
+		VkPresentModeKHR PresentMode = PresentModes[i];
+		if (PresentMode == VK_PRESENT_MODE_MAILBOX_KHR)
+		{
+			Result = PresentMode;
+			break;
+		}
+	}
+	return Result;
+}
+
+static VkExtent2D ChooseSwapExtent(VkSurfaceCapabilitiesKHR* Capabilities, GLFWwindow* Window)
+{
+	VkExtent2D Result = Capabilities->currentExtent;
+	if (Capabilities->currentExtent.width == 0xFF'FF'FF'FF)
+	{
+		// TODO: Is this shit actually necessary?
+		s32 WindowWidth, WindowHeight;
+		glfwGetFramebufferSize(Window, &WindowWidth, &WindowHeight);
+
+		Result.width = Clamp((u32)WindowWidth, Capabilities->minImageExtent.width, Capabilities->maxImageExtent.width);
+		Result.height = Clamp((u32)WindowHeight, Capabilities->minImageExtent.height, Capabilities->maxImageExtent.height);
+	}
+	return Result;
+}
+
 struct physical_device_deets
 {
 	VkPhysicalDevice Device;
 	queue_family_indices QueueFamilyIndices;
+	swap_chain_deets SwapChainDeets;
 };
 
 static physical_device_deets PickPhysicalDevice(VkInstance Instance, VkSurfaceKHR Surface)
@@ -255,11 +389,23 @@ static physical_device_deets PickPhysicalDevice(VkInstance Instance, VkSurfaceKH
 		for (u32 i = 0; i < NumDevices; i++)
 		{
 			queue_family_indices QueueFamilyIndices = FindQueueFamilies(Devices[i], Surface);
-			u32 Score = RateDeviceSuitability(Devices[i], QueueFamilyIndices);
+			swap_chain_deets SwapChainDeets = QuerySwapChainSupport(Devices[i], Surface);
+			u32 Score = RateDeviceSuitability(Devices[i], QueueFamilyIndices, &SwapChainDeets);
 			if (Score > HighestScore)
 			{
-				Result = { .Device = Devices[i], .QueueFamilyIndices = QueueFamilyIndices };
+				Result = { .Device = Devices[i], .QueueFamilyIndices = QueueFamilyIndices, .SwapChainDeets = SwapChainDeets };
 				HighestScore = Score;
+			}
+			else
+			{
+				if (SwapChainDeets.Formats)
+				{
+					free(SwapChainDeets.Formats);
+				}
+				if (SwapChainDeets.PresentModes)
+				{
+					free(SwapChainDeets.PresentModes);
+				}
 			}
 		}
 		if (!Result.Device)
@@ -379,7 +525,9 @@ static VkDevice CreateLogicalDevice(physical_device_deets DeviceDeets)
 		.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
 		.queueCreateInfoCount = 1,
 		.pQueueCreateInfos = &QueueCreateInfo,
-		.pEnabledFeatures = &DeviceFeatures
+		.enabledExtensionCount = ArrayCount(DEVICE_EXTENSIONS),
+		.ppEnabledExtensionNames = DEVICE_EXTENSIONS,
+		.pEnabledFeatures = &DeviceFeatures,
 	};
 #if _DEBUG
 	DeviceCreateInfo.enabledLayerCount = ArrayCount(VALIDATION_LAYERS);
@@ -412,12 +560,106 @@ static VkSurfaceKHR CreateSurface(VkInstance Instance, GLFWwindow* Window)
 	return Result;
 }
 
+struct swap_chain
+{
+	VkSwapchainKHR Handle;
+	VkImage* Images;
+	VkImageView* ImageViews;
+	u32 NumImages;
+	VkFormat Format;
+	VkExtent2D Extents;
+};
+
+static swap_chain CreateSwapChain(physical_device_deets* DeviceDeets, VkDevice LogicalDevice, GLFWwindow* Window, VkSurfaceKHR Surface)
+{
+	swap_chain Result = {};
+
+	swap_chain_deets* SwapChainDeets = &DeviceDeets->SwapChainDeets;
+	VkSurfaceFormatKHR SurfaceFormat = ChooseSwapSurfaceFormat(SwapChainDeets->Formats, SwapChainDeets->NumFormats);
+	VkPresentModeKHR PresentMode = ChooseSwapPresentMode(SwapChainDeets->PresentModes, SwapChainDeets->NumPresentModes);
+	Result.Extents = ChooseSwapExtent(&SwapChainDeets->Capabilities, Window);
+
+	u32 ImageCount = SwapChainDeets->Capabilities.minImageCount + 1;
+	if (SwapChainDeets->Capabilities.maxImageCount != 0 && ImageCount > SwapChainDeets->Capabilities.maxImageCount)
+	{
+		ImageCount = SwapChainDeets->Capabilities.maxImageCount;
+	}
+
+	// TODO: Oink, oink...
+	Assert(DeviceDeets->QueueFamilyIndices.GraphicsFamily == DeviceDeets->QueueFamilyIndices.PresentFamily);
+	Assert((DeviceDeets->QueueFamilyIndices.ValidFlags & QueueFamily_Graphics) && (DeviceDeets->QueueFamilyIndices.ValidFlags & QueueFamily_Present));
+	VkSwapchainCreateInfoKHR CreateInfo
+	{
+		.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
+		.surface = Surface,
+		.minImageCount = ImageCount,
+		.imageFormat = SurfaceFormat.format,
+		.imageColorSpace = SurfaceFormat.colorSpace,
+		.imageExtent = Result.Extents,
+		.imageArrayLayers = 1, // Only > 1 if we're doing stereo 3D rendering
+		.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+		.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
+		.preTransform = SwapChainDeets->Capabilities.currentTransform,
+		.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
+		.presentMode = PresentMode,
+		.clipped = VK_TRUE, // TODO: Any case where we don't want to do any clipping?
+		// TODO: Handle window resizing via 'oldSwapchain'
+	};
+	Result.Format = SurfaceFormat.format;
+
+	if (vkCreateSwapchainKHR(LogicalDevice, &CreateInfo, nullptr, &Result.Handle) == VK_SUCCESS) // pAllocator
+	{
+		vkGetSwapchainImagesKHR(LogicalDevice, Result.Handle, &Result.NumImages, nullptr);
+		Result.Images = AllocArray(VkImage, Result.NumImages);
+		vkGetSwapchainImagesKHR(LogicalDevice, Result.Handle, &Result.NumImages, Result.Images);
+
+		Result.ImageViews = AllocArray(VkImageView, Result.NumImages);
+		for (u32 i = 0; i < Result.NumImages; i++)
+		{
+			VkImageViewCreateInfo IvCreateInfo
+			{
+				.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+				.image = Result.Images[i],
+				.viewType = VK_IMAGE_VIEW_TYPE_2D,
+				.format = Result.Format,
+				.components = 
+				{
+					.r = VK_COMPONENT_SWIZZLE_IDENTITY,
+					.g = VK_COMPONENT_SWIZZLE_IDENTITY,
+					.b = VK_COMPONENT_SWIZZLE_IDENTITY,
+					.a = VK_COMPONENT_SWIZZLE_IDENTITY,
+				},
+				.subresourceRange =
+				{
+					.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+					.baseMipLevel = 0,
+					.levelCount = 1,
+					.baseArrayLayer = 0,
+					.layerCount = 1
+				},
+			};
+			if (vkCreateImageView(LogicalDevice, &IvCreateInfo, nullptr, Result.ImageViews + i) != VK_SUCCESS) // pAllocator
+			{
+				Assert(false);
+				fprintf(stderr, "Failed to create image view number %u...\n", i);
+			}
+		}
+	}
+	else
+	{
+		Assert(false);
+		fprintf(stderr, "Failed to create swap chain, my dude\n");
+	}
+	return Result;
+}
+
 struct vulkan_stuff
 {
 	VkInstance Instance;
-	VkDevice Device;
+	VkDevice Device; // the logical device, obvs.
 	VkSurfaceKHR Surface;
 	VkQueue GraphicsQueue;
+	swap_chain Swapchain;
 };
 
 static vulkan_stuff InitVulkan(GLFWwindow* Window)
@@ -429,6 +671,7 @@ static vulkan_stuff InitVulkan(GLFWwindow* Window)
 	physical_device_deets PhysicalDevice = PickPhysicalDevice(Result.Instance, Result.Surface);
 	Result.Device = CreateLogicalDevice(PhysicalDevice);
 	vkGetDeviceQueue(Result.Device, PhysicalDevice.QueueFamilyIndices.GraphicsFamily, 0, &Result.GraphicsQueue);
+	Result.Swapchain = CreateSwapChain(&PhysicalDevice, Result.Device, Window, Result.Surface);
 
 	return Result;
 }
@@ -446,6 +689,13 @@ static void CleanUp(GLFWwindow* Window, vulkan_stuff VulkanStuff)
 #if _DEBUG
 	DestroyDebugCallback(VulkanStuff.Instance);
 #endif
+
+	for (u32 i = 0; i < VulkanStuff.Swapchain.NumImages; i++)
+	{
+		vkDestroyImageView(VulkanStuff.Device, VulkanStuff.Swapchain.ImageViews[i], nullptr); // pAllocator
+	}
+
+	vkDestroySwapchainKHR(VulkanStuff.Device, VulkanStuff.Swapchain.Handle, nullptr); // pAllocator
 	vkDestroyDevice(VulkanStuff.Device, nullptr); // pAllocator
 	vkDestroySurfaceKHR(VulkanStuff.Instance, VulkanStuff.Surface, nullptr); // pAllocator
 	vkDestroyInstance(VulkanStuff.Instance, nullptr); // pAllocator
