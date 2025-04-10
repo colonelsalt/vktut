@@ -1307,5 +1307,7 @@
       <Filter>Header Files</Filter>
     </None>
     <None Include=".gitignore" />
+    <None Include="shaders\frag.frag" />
+    <None Include="shaders\vert.vert" />
   </ItemGroup>
 </Project>

@@ -12,6 +12,7 @@
 typedef int8_t s8;
 typedef uint8_t u8;
 typedef uint32_t u32;
+typedef uint64_t u64;
 typedef int32_t s32;
 typedef uint32_t b32;
 typedef float f32;
@@ -31,6 +32,46 @@ static u32 Clamp(u32 Value, u32 Min, u32 Max)
 	else if (Value > Max)
 	{
 		Result = Max;
+	}
+	return Result;
+}
+
+struct file_buffer
+{
+	u8* Contents;
+	u32 Size;
+};
+
+static file_buffer LoadFile(const char* FileName)
+{
+	file_buffer Result = {};
+
+	HANDLE FileHandle = CreateFileA(FileName, GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, 0, 0);
+	if (FileHandle == INVALID_HANDLE_VALUE)
+	{
+		fprintf(stderr, "Seems like file '%s' doesn't exist, bro\n", FileName);
+		Assert(false);
+	}
+	else
+	{
+		LARGE_INTEGER FileSize;
+		if (GetFileSizeEx(FileHandle, &FileSize))
+		{
+			Result.Size = (u32)FileSize.QuadPart;
+			Result.Contents = AllocArray(u8, Result.Size);
+			DWORD BytesRead;
+			if (!ReadFile(FileHandle, Result.Contents, Result.Size, &BytesRead, nullptr) ||
+				Result.Size != BytesRead)
+			{
+				fprintf(stderr, "Failed to read file '%s'\n", FileName);
+				free(Result.Contents);
+				Result = {};
+			}
+		}
+		else
+		{
+			Assert(false); // Couldn't get file size??
+		}
 	}
 	return Result;
 }
@@ -172,6 +213,23 @@ static b32 AreValidationLayersSupported()
 }
 #endif
 
+static VkShaderModule CreateShaderModule(VkDevice Device, file_buffer ShaderFile)
+{
+	VkShaderModuleCreateInfo CreateInfo
+	{
+		.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+		.codeSize = ShaderFile.Size,
+		.pCode = (u32*)ShaderFile.Contents, // TODO: Align to 4-byte memory necessary here?
+	};
+	VkShaderModule Result = VK_NULL_HANDLE;
+	if (vkCreateShaderModule(Device, &CreateInfo, nullptr, &Result) != VK_SUCCESS) // pAllocator
+	{
+		fprintf(stderr, "Failed to create shader... :(\n");
+		Assert(false);
+	}
+	return Result;
+}
+
 struct swap_chain_deets
 {
 	VkSurfaceCapabilitiesKHR Capabilities;
@@ -249,7 +307,7 @@ struct queue_family_indices
 };
 
 // TODO: Don't we just want to find the one queue that supports both graphics and presenting, and save some hassle?
-queue_family_indices FindQueueFamilies(VkPhysicalDevice Device, VkSurfaceKHR Surface)
+static queue_family_indices FindQueueFamilies(VkPhysicalDevice Device, VkSurfaceKHR Surface)
 {
 	queue_family_indices Result = {};
 
@@ -653,13 +711,212 @@ static swap_chain CreateSwapChain(physical_device_deets* DeviceDeets, VkDevice L
 	return Result;
 }
 
+static VkRenderPass CreateRenderPass(VkDevice Device, swap_chain* Swapchain)
+{
+	VkAttachmentDescription ColourAttachment
+	{
+		.format = Swapchain->Format,
+		.samples = VK_SAMPLE_COUNT_1_BIT,
+		.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+		.storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+		.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+		.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+		.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+		.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+	};
+	VkAttachmentReference ColourAttachmentRef
+	{
+		.attachment = 0, // NOTE: This is the index of 'layout(location = 0)' in the fragment shader
+		.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+	};
+	VkSubpassDescription Subpass
+	{
+		.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
+		.colorAttachmentCount = 1,
+		.pColorAttachments = &ColourAttachmentRef,
+	};
+
+	VkRenderPassCreateInfo RenderPassInfo
+	{
+		.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
+		.attachmentCount = 1,
+		.pAttachments = &ColourAttachment,
+		.subpassCount = 1,
+		.pSubpasses = &Subpass,
+	};
+
+	VkRenderPass Result = VK_NULL_HANDLE;
+	if (vkCreateRenderPass(Device, &RenderPassInfo, nullptr, &Result) != VK_SUCCESS) // pAllocator
+	{
+		fprintf(stderr, "Couldn't make that render pass, my dude\n");
+		Assert(false);
+	}
+	return Result;
+}
+
+struct vulkan_pipeline
+{
+	VkPipeline Handle;
+	VkPipelineLayout Layout;
+};
+
+static vulkan_pipeline CreateGraphicsPipeline(VkDevice Device, swap_chain* Swapchain, VkRenderPass RenderPass)
+{
+	file_buffer VertShaderCode = LoadFile("shaders/vert.spv");
+	file_buffer FragShaderCode = LoadFile("shaders/frag.spv");
+
+	VkShaderModule VertShaderModule = CreateShaderModule(Device, VertShaderCode);
+	VkShaderModule FragShaderModule = CreateShaderModule(Device, FragShaderCode);
+	free(VertShaderCode.Contents);
+	free(FragShaderCode.Contents);
+
+	VkPipelineShaderStageCreateInfo VertShaderStageInfo
+	{
+		.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+		.stage = VK_SHADER_STAGE_VERTEX_BIT,
+		.module = VertShaderModule,
+		.pName = "main"
+	};
+	VkPipelineShaderStageCreateInfo FragShaderStageInfo
+	{
+		.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+		.stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+		.module = FragShaderModule,
+		.pName = "main"
+	};
+	VkPipelineShaderStageCreateInfo ShaderStages[] = { VertShaderStageInfo, FragShaderStageInfo };
+
+	static constexpr VkDynamicState DYNAMIC_STATES[] =  { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+
+	VkPipelineDynamicStateCreateInfo DynamicState
+	{
+		.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+		.dynamicStateCount = ArrayCount(DYNAMIC_STATES),
+		.pDynamicStates = DYNAMIC_STATES
+	};
+
+	VkPipelineVertexInputStateCreateInfo VertextInputInfo
+	{
+		.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+	};
+
+	VkPipelineInputAssemblyStateCreateInfo InputAssembly
+	{
+		.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+		.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+	};
+
+	VkViewport Viewport
+	{
+		.x = 0.0f,
+		.y = 0.0f,
+		.width = (f32)Swapchain->Extents.width,
+		.height = (f32)Swapchain->Extents.height,
+		.minDepth = 0.0f,
+		.maxDepth = 1.0f
+	};
+	VkRect2D Scissor
+	{
+		.offset = { .x = 0, .y = 0 },
+		.extent = Swapchain->Extents
+	};
+
+	VkPipelineViewportStateCreateInfo ViewportState
+	{
+		.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+		.viewportCount = 1,
+		.scissorCount = 1,
+	};
+
+	VkPipelineRasterizationStateCreateInfo Rasteriser
+	{
+		.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+		.polygonMode = VK_POLYGON_MODE_FILL,
+		.cullMode = VK_CULL_MODE_BACK_BIT,
+		.frontFace = VK_FRONT_FACE_CLOCKWISE,
+		.lineWidth = 1.0f, // TODO: I'm not drawing any lines, do I need this??
+	};
+
+	VkPipelineMultisampleStateCreateInfo Multisampling
+	{
+		.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+		.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
+		.sampleShadingEnable = VK_FALSE,
+		.minSampleShading = 1.0f,
+	};
+
+	// TODO: This sets basic bitch alpha blending - is this actually what we want?
+	VkPipelineColorBlendAttachmentState ColourBlendAttachment
+	{
+		.blendEnable = VK_TRUE,
+		.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA,
+		.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+		.colorBlendOp = VK_BLEND_OP_ADD,
+		.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
+		.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO, // TODO: Is this right?? We're not taking the dest alpha into account at all??
+		.alphaBlendOp = VK_BLEND_OP_ADD,
+		.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
+	};
+
+	VkPipelineColorBlendStateCreateInfo GlobalColourBlend
+	{
+		.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+		.logicOpEnable = VK_FALSE,
+		.attachmentCount = 1,
+		.pAttachments = &ColourBlendAttachment,
+	};
+
+	VkPipelineLayoutCreateInfo LayoutCreateInfo
+	{
+		.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO
+	};
+
+	vulkan_pipeline Result = {};
+	if (vkCreatePipelineLayout(Device, &LayoutCreateInfo, nullptr, &Result.Layout) == VK_SUCCESS) // pAllocator
+	{
+		VkGraphicsPipelineCreateInfo PipelineInfo
+		{
+			.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+			.stageCount = 2,
+			.pStages = ShaderStages,
+			.pVertexInputState = &VertextInputInfo,
+			.pInputAssemblyState = &InputAssembly,
+			.pViewportState = &ViewportState,
+			.pRasterizationState = &Rasteriser,
+			.pMultisampleState = &Multisampling,
+			.pColorBlendState = &GlobalColourBlend,
+			.pDynamicState = &DynamicState,
+			.layout = Result.Layout,
+			.renderPass = RenderPass,
+			.subpass = 0
+		};
+		if (vkCreateGraphicsPipelines(Device, VK_NULL_HANDLE, 1, &PipelineInfo, nullptr, &Result.Handle) != VK_SUCCESS) // pAllocator
+		{
+			fprintf(stderr, "Failed to create graphics pipeline\n");
+			Assert(false);
+		}
+	}
+	else
+	{
+		fprintf(stderr, "Couldn't create that pipeline layout\n");
+		Assert(false);
+	}
+
+	vkDestroyShaderModule(Device, VertShaderModule, nullptr); // pAllocator
+	vkDestroyShaderModule(Device, FragShaderModule, nullptr); // pAllocator
+
+	return Result;
+}
+
 struct vulkan_stuff
 {
 	VkInstance Instance;
 	VkDevice Device; // the logical device, obvs.
 	VkSurfaceKHR Surface;
 	VkQueue GraphicsQueue;
+	VkRenderPass RenderPass;
 	swap_chain Swapchain;
+	vulkan_pipeline Pipeline;
 };
 
 static vulkan_stuff InitVulkan(GLFWwindow* Window)
@@ -672,6 +929,8 @@ static vulkan_stuff InitVulkan(GLFWwindow* Window)
 	Result.Device = CreateLogicalDevice(PhysicalDevice);
 	vkGetDeviceQueue(Result.Device, PhysicalDevice.QueueFamilyIndices.GraphicsFamily, 0, &Result.GraphicsQueue);
 	Result.Swapchain = CreateSwapChain(&PhysicalDevice, Result.Device, Window, Result.Surface);
+	Result.RenderPass = CreateRenderPass(Result.Device, &Result.Swapchain);
+	Result.Pipeline = CreateGraphicsPipeline(Result.Device, &Result.Swapchain, Result.RenderPass);
 
 	return Result;
 }
@@ -689,7 +948,9 @@ static void CleanUp(GLFWwindow* Window, vulkan_stuff VulkanStuff)
 #if _DEBUG
 	DestroyDebugCallback(VulkanStuff.Instance);
 #endif
-
+	vkDestroyPipeline(VulkanStuff.Device, VulkanStuff.Pipeline.Handle, nullptr); // pAllocator
+	vkDestroyPipelineLayout(VulkanStuff.Device, VulkanStuff.Pipeline.Layout, nullptr); // pAllocator
+	vkDestroyRenderPass(VulkanStuff.Device, VulkanStuff.RenderPass, nullptr); // pAllocator
 	for (u32 i = 0; i < VulkanStuff.Swapchain.NumImages; i++)
 	{
 		vkDestroyImageView(VulkanStuff.Device, VulkanStuff.Swapchain.ImageViews[i], nullptr); // pAllocator
