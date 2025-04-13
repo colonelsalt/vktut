@@ -268,7 +268,7 @@ static swap_chain_deets QuerySwapChainSupport(VkPhysicalDevice Device, VkSurface
 	return Result;
 }
 
-b32 CheckDeviceSupportsExtensions(VkPhysicalDevice Device)
+static b32 CheckDeviceSupportsExtensions(VkPhysicalDevice Device)
 {
 	u32 NumExtensions = 0;
 	vkEnumerateDeviceExtensionProperties(Device, nullptr, &NumExtensions, nullptr);
@@ -623,10 +623,36 @@ struct swap_chain
 	VkSwapchainKHR Handle;
 	VkImage* Images;
 	VkImageView* ImageViews;
+	VkFramebuffer* Framebuffers;
 	u32 NumImages;
 	VkFormat Format;
 	VkExtent2D Extents;
 };
+
+static void CreateFramebuffers(swap_chain* Swapchain, VkDevice Device, VkRenderPass RenderPass)
+{
+	Swapchain->Framebuffers = AllocArray(VkFramebuffer, Swapchain->NumImages);
+	for (u32 i = 0; i < Swapchain->NumImages; i++)
+	{
+		VkImageView* Attachment = Swapchain->ImageViews + i;
+
+		VkFramebufferCreateInfo FramebufferInfo
+		{
+			.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+			.renderPass = RenderPass,
+			.attachmentCount = 1,
+			.pAttachments = Attachment,
+			.width = Swapchain->Extents.width,
+			.height = Swapchain->Extents.height,
+			.layers = 1
+		};
+		if (vkCreateFramebuffer(Device, &FramebufferInfo, nullptr, Swapchain->Framebuffers + i) != VK_SUCCESS) // pAllocator
+		{
+			fprintf(stderr, "Failed to create framebuffer number %u\n", i);
+			Assert(false);
+		}
+	}
+}
 
 static swap_chain CreateSwapChain(physical_device_deets* DeviceDeets, VkDevice LogicalDevice, GLFWwindow* Window, VkSurfaceKHR Surface)
 {
@@ -736,6 +762,17 @@ static VkRenderPass CreateRenderPass(VkDevice Device, swap_chain* Swapchain)
 		.pColorAttachments = &ColourAttachmentRef,
 	};
 
+	// TODO: I don't understand this at all... what's going on here??
+	VkSubpassDependency Dependency
+	{
+		.srcSubpass = VK_SUBPASS_EXTERNAL,
+		.dstSubpass = 0,
+		.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+		.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+		.srcAccessMask = 0,
+		.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+	};
+
 	VkRenderPassCreateInfo RenderPassInfo
 	{
 		.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
@@ -743,6 +780,8 @@ static VkRenderPass CreateRenderPass(VkDevice Device, swap_chain* Swapchain)
 		.pAttachments = &ColourAttachment,
 		.subpassCount = 1,
 		.pSubpasses = &Subpass,
+		.dependencyCount = 1,
+		.pDependencies = &Dependency,
 	};
 
 	VkRenderPass Result = VK_NULL_HANDLE;
@@ -908,6 +947,42 @@ static vulkan_pipeline CreateGraphicsPipeline(VkDevice Device, swap_chain* Swapc
 	return Result;
 }
 
+static VkCommandPool CreateCommandPool(VkDevice Device, u32 QueueFamilyIndex)
+{
+	VkCommandPoolCreateInfo PoolInfo
+	{
+		.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+		.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+		.queueFamilyIndex = QueueFamilyIndex
+	};
+	VkCommandPool Result = VK_NULL_HANDLE;
+	if (vkCreateCommandPool(Device, &PoolInfo, nullptr, &Result) != VK_SUCCESS) // pAllocator
+	{
+		fprintf(stderr, "Failed to create command pool homies\n");
+		Assert(false);
+	}
+	return Result;
+}
+
+static VkCommandBuffer CreateCommandBuffer(VkDevice Device, VkCommandPool CommandPool)
+{
+	VkCommandBufferAllocateInfo AllocInfo
+	{
+		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+		.commandPool = CommandPool,
+		.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+		.commandBufferCount = 1
+	};
+	VkCommandBuffer Result = VK_NULL_HANDLE;
+	// TODO: Does this just allocate GPU memory (in some opaque way), hence why we're not passing a pAllocator?
+	if (vkAllocateCommandBuffers(Device, &AllocInfo, &Result) != VK_SUCCESS)
+	{
+		fprintf(stderr, "Failed to allocate a command buffer my dudes\n");
+		Assert(false);
+	}
+	return Result;
+}
+
 struct vulkan_stuff
 {
 	VkInstance Instance;
@@ -915,9 +990,35 @@ struct vulkan_stuff
 	VkSurfaceKHR Surface;
 	VkQueue GraphicsQueue;
 	VkRenderPass RenderPass;
+	VkCommandPool CommandPool;
+	VkCommandBuffer CommandBuffer;
 	swap_chain Swapchain;
 	vulkan_pipeline Pipeline;
+
+	VkSemaphore ImageAvailableSemaphore;
+	VkSemaphore RenderFinishedSempaphore;
+	VkFence InFlightFence;
 };
+
+static void CreateSyncObjects(vulkan_stuff* OutVulkanStuff)
+{
+	VkSemaphoreCreateInfo SempahoreInfo
+	{
+		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+	};
+	VkFenceCreateInfo FenceInfo
+	{
+		.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+		.flags = VK_FENCE_CREATE_SIGNALED_BIT,
+	};
+	if (vkCreateSemaphore(OutVulkanStuff->Device, &SempahoreInfo, nullptr, &OutVulkanStuff->ImageAvailableSemaphore) != VK_SUCCESS || // pAllocator
+		vkCreateSemaphore(OutVulkanStuff->Device, &SempahoreInfo, nullptr, &OutVulkanStuff->RenderFinishedSempaphore) != VK_SUCCESS || // pAllocator
+		vkCreateFence(OutVulkanStuff->Device, &FenceInfo, nullptr, &OutVulkanStuff->InFlightFence) != VK_SUCCESS) // pAllocator
+	{
+		fprintf(stderr, "Failed to create them semaphores and/or fences mate\n");
+		Assert(false);
+	}
+}
 
 static vulkan_stuff InitVulkan(GLFWwindow* Window)
 {
@@ -931,35 +1032,148 @@ static vulkan_stuff InitVulkan(GLFWwindow* Window)
 	Result.Swapchain = CreateSwapChain(&PhysicalDevice, Result.Device, Window, Result.Surface);
 	Result.RenderPass = CreateRenderPass(Result.Device, &Result.Swapchain);
 	Result.Pipeline = CreateGraphicsPipeline(Result.Device, &Result.Swapchain, Result.RenderPass);
+	CreateFramebuffers(&Result.Swapchain, Result.Device, Result.RenderPass);
+	Result.CommandPool = CreateCommandPool(Result.Device, PhysicalDevice.QueueFamilyIndices.GraphicsFamily);
+	Result.CommandBuffer = CreateCommandBuffer(Result.Device, Result.CommandPool);
+	CreateSyncObjects(&Result);
 
 	return Result;
 }
 
-static void MainLoop(GLFWwindow* Window)
+static void RecordCommandBuffer(vulkan_stuff* VulkanStuff, u32 ImageIndex)
+{
+	VkCommandBufferBeginInfo BeginInfo
+	{
+		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO
+	};
+	if (vkBeginCommandBuffer(VulkanStuff->CommandBuffer, &BeginInfo) == VK_SUCCESS)
+	{
+		VkClearValue ClearColour { .color = { 0.0f, 0.0f, 0.0f, 1.0f } };
+		Assert(ImageIndex < VulkanStuff->Swapchain.NumImages);
+		VkRenderPassBeginInfo RenderPassInfo
+		{
+			.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+			.renderPass = VulkanStuff->RenderPass,
+			.framebuffer = VulkanStuff->Swapchain.Framebuffers[ImageIndex],
+			.renderArea = { .offset = {0, 0}, .extent = VulkanStuff->Swapchain.Extents },
+			.clearValueCount = 1,
+			.pClearValues = &ClearColour
+		};
+		vkCmdBeginRenderPass(VulkanStuff->CommandBuffer, &RenderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
+		vkCmdBindPipeline(VulkanStuff->CommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, VulkanStuff->Pipeline.Handle);
+		
+		VkViewport Viewport
+		{
+			.x = 0.0f,
+			.y = 0.0f,
+			.width = (f32)VulkanStuff->Swapchain.Extents.width,
+			.height = (f32)VulkanStuff->Swapchain.Extents.height,
+			.minDepth = 0.0f,
+			.maxDepth = 1.0f,
+		};
+		vkCmdSetViewport(VulkanStuff->CommandBuffer, 0, 1, &Viewport);
+
+		VkRect2D Scissor { .extent = VulkanStuff->Swapchain.Extents };
+		vkCmdSetScissor(VulkanStuff->CommandBuffer, 0, 1, &Scissor);
+
+		vkCmdDraw(VulkanStuff->CommandBuffer, 3, 1, 0, 0);
+
+		vkCmdEndRenderPass(VulkanStuff->CommandBuffer);
+
+		if (vkEndCommandBuffer(VulkanStuff->CommandBuffer) != VK_SUCCESS)
+		{
+			fprintf(stderr, "Failed to end/record command buffer\n");
+			Assert(false);
+		}
+	}
+	else
+	{
+		fprintf(stderr, "Failed to begin recording command buffer or something\n");
+		Assert(false);
+	}
+}
+
+static void DrawFrame(vulkan_stuff* VulkanStuff)
+{
+	vkWaitForFences(VulkanStuff->Device, 1, &VulkanStuff->InFlightFence, VK_TRUE, UINT64_MAX);
+	vkResetFences(VulkanStuff->Device, 1, &VulkanStuff->InFlightFence);
+
+	u32 ImageIndex;
+	// Sooo... the ImageIndex is written to immediately, but the image may in fact not be available to use until the semaphore has signalled..?
+	vkAcquireNextImageKHR(VulkanStuff->Device, VulkanStuff->Swapchain.Handle, UINT64_MAX, VulkanStuff->ImageAvailableSemaphore, VK_NULL_HANDLE, &ImageIndex);
+
+	vkResetCommandBuffer(VulkanStuff->CommandBuffer, 0);
+	RecordCommandBuffer(VulkanStuff, ImageIndex);
+
+	VkPipelineStageFlags WaitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+	VkSubmitInfo SubmitInfo
+	{
+		.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+		.waitSemaphoreCount = 1,
+		.pWaitSemaphores = &VulkanStuff->ImageAvailableSemaphore,
+		.pWaitDstStageMask = &WaitStage,
+		.commandBufferCount = 1,
+		.pCommandBuffers = &VulkanStuff->CommandBuffer,
+		.signalSemaphoreCount = 1,
+		.pSignalSemaphores = &VulkanStuff->RenderFinishedSempaphore,
+	};
+
+	if (vkQueueSubmit(VulkanStuff->GraphicsQueue, 1, &SubmitInfo, VulkanStuff->InFlightFence) == VK_SUCCESS)
+	{
+		VkPresentInfoKHR PresentInfo
+		{
+			.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+			.waitSemaphoreCount = 1,
+			.pWaitSemaphores = &VulkanStuff->RenderFinishedSempaphore,
+			.swapchainCount = 1,
+			.pSwapchains = &VulkanStuff->Swapchain.Handle,
+			.pImageIndices = &ImageIndex,
+		};
+		vkQueuePresentKHR(VulkanStuff->GraphicsQueue, &PresentInfo);
+	}
+	else
+	{
+		fprintf(stderr, "Couldn't submit draw command buffer\n");
+		Assert(false);
+	}
+}
+
+static void MainLoop(GLFWwindow* Window, vulkan_stuff* VulkanStuff)
 {
 	while (!glfwWindowShouldClose(Window))
 	{
 		glfwPollEvents();
+		DrawFrame(VulkanStuff);
 	}
+
+	vkDeviceWaitIdle(VulkanStuff->Device);
 }
 
-static void CleanUp(GLFWwindow* Window, vulkan_stuff VulkanStuff)
+static void CleanUp(GLFWwindow* Window, vulkan_stuff* VulkanStuff)
 {
 #if _DEBUG
-	DestroyDebugCallback(VulkanStuff.Instance);
+	DestroyDebugCallback(VulkanStuff->Instance);
 #endif
-	vkDestroyPipeline(VulkanStuff.Device, VulkanStuff.Pipeline.Handle, nullptr); // pAllocator
-	vkDestroyPipelineLayout(VulkanStuff.Device, VulkanStuff.Pipeline.Layout, nullptr); // pAllocator
-	vkDestroyRenderPass(VulkanStuff.Device, VulkanStuff.RenderPass, nullptr); // pAllocator
-	for (u32 i = 0; i < VulkanStuff.Swapchain.NumImages; i++)
+	vkDestroySemaphore(VulkanStuff->Device, VulkanStuff->ImageAvailableSemaphore, nullptr); // pAllocator
+	vkDestroySemaphore(VulkanStuff->Device, VulkanStuff->RenderFinishedSempaphore, nullptr); // pAllocator
+	vkDestroyFence(VulkanStuff->Device, VulkanStuff->InFlightFence, nullptr); // pAllocator
+	vkDestroyCommandPool(VulkanStuff->Device, VulkanStuff->CommandPool, nullptr); // pAllocator
+	for (u32 i = 0; i < VulkanStuff->Swapchain.NumImages; i++)
 	{
-		vkDestroyImageView(VulkanStuff.Device, VulkanStuff.Swapchain.ImageViews[i], nullptr); // pAllocator
+		vkDestroyFramebuffer(VulkanStuff->Device, VulkanStuff->Swapchain.Framebuffers[i], nullptr); // pAllocator
+	}
+	vkDestroyPipeline(VulkanStuff->Device, VulkanStuff->Pipeline.Handle, nullptr); // pAllocator
+	vkDestroyPipelineLayout(VulkanStuff->Device, VulkanStuff->Pipeline.Layout, nullptr); // pAllocator
+	vkDestroyRenderPass(VulkanStuff->Device, VulkanStuff->RenderPass, nullptr); // pAllocator
+	for (u32 i = 0; i < VulkanStuff->Swapchain.NumImages; i++)
+	{
+		vkDestroyImageView(VulkanStuff->Device, VulkanStuff->Swapchain.ImageViews[i], nullptr); // pAllocator
 	}
 
-	vkDestroySwapchainKHR(VulkanStuff.Device, VulkanStuff.Swapchain.Handle, nullptr); // pAllocator
-	vkDestroyDevice(VulkanStuff.Device, nullptr); // pAllocator
-	vkDestroySurfaceKHR(VulkanStuff.Instance, VulkanStuff.Surface, nullptr); // pAllocator
-	vkDestroyInstance(VulkanStuff.Instance, nullptr); // pAllocator
+	vkDestroySwapchainKHR(VulkanStuff->Device, VulkanStuff->Swapchain.Handle, nullptr); // pAllocator
+	vkDestroyDevice(VulkanStuff->Device, nullptr); // pAllocator
+	vkDestroySurfaceKHR(VulkanStuff->Instance, VulkanStuff->Surface, nullptr); // pAllocator
+	vkDestroyInstance(VulkanStuff->Instance, nullptr); // pAllocator
 	glfwDestroyWindow(Window);
 	glfwTerminate();
 }
@@ -968,6 +1182,6 @@ int main()
 {
 	GLFWwindow* Window = InitWindow();
 	vulkan_stuff VulkanStuff = InitVulkan(Window);
-	MainLoop(Window);
-	CleanUp(Window, VulkanStuff);
+	MainLoop(Window, &VulkanStuff);
+	CleanUp(Window, &VulkanStuff);
 }
