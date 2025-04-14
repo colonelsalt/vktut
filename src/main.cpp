@@ -76,15 +76,6 @@ static file_buffer LoadFile(const char* FileName)
 	return Result;
 }
 
-static GLFWwindow* InitWindow()
-{
-	glfwInit();
-	glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-	glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
-	GLFWwindow* Window = glfwCreateWindow(800, 600, "This is a window, mate", nullptr, nullptr);
-	return Window;
-}
-
 static constexpr const char* VALIDATION_LAYERS[] =
 {
 	"VK_LAYER_KHRONOS_validation"
@@ -423,7 +414,7 @@ static VkExtent2D ChooseSwapExtent(VkSurfaceCapabilitiesKHR* Capabilities, GLFWw
 
 struct physical_device_deets
 {
-	VkPhysicalDevice Device;
+	VkPhysicalDevice Handle;
 	queue_family_indices QueueFamilyIndices;
 	swap_chain_deets SwapChainDeets;
 };
@@ -451,7 +442,7 @@ static physical_device_deets PickPhysicalDevice(VkInstance Instance, VkSurfaceKH
 			u32 Score = RateDeviceSuitability(Devices[i], QueueFamilyIndices, &SwapChainDeets);
 			if (Score > HighestScore)
 			{
-				Result = { .Device = Devices[i], .QueueFamilyIndices = QueueFamilyIndices, .SwapChainDeets = SwapChainDeets };
+				Result = { .Handle = Devices[i], .QueueFamilyIndices = QueueFamilyIndices, .SwapChainDeets = SwapChainDeets };
 				HighestScore = Score;
 			}
 			else
@@ -466,7 +457,7 @@ static physical_device_deets PickPhysicalDevice(VkInstance Instance, VkSurfaceKH
 				}
 			}
 		}
-		if (!Result.Device)
+		if (!Result.Handle)
 		{
 			Assert(false);
 			fprintf(stderr, "Failed to find suitable GPU - they're all shit!\n");
@@ -592,7 +583,7 @@ static VkDevice CreateLogicalDevice(physical_device_deets DeviceDeets)
 	DeviceCreateInfo.ppEnabledLayerNames = VALIDATION_LAYERS;
 #endif
 	VkDevice Result = VK_NULL_HANDLE;
-	if (vkCreateDevice(DeviceDeets.Device, &DeviceCreateInfo, nullptr, &Result) != VK_SUCCESS) // pAllocator
+	if (vkCreateDevice(DeviceDeets.Handle, &DeviceCreateInfo, nullptr, &Result) != VK_SUCCESS) // pAllocator
 	{
 		Assert(false);
 		fprintf(stderr, "Failed to create logical device!\n");
@@ -631,6 +622,7 @@ struct swap_chain
 
 static void CreateFramebuffers(swap_chain* Swapchain, VkDevice Device, VkRenderPass RenderPass)
 {
+	// TODO: Is this the cleanest way of reusing memory from previous framebuffers?
 	Swapchain->Framebuffers = AllocArray(VkFramebuffer, Swapchain->NumImages);
 	for (u32 i = 0; i < Swapchain->NumImages; i++)
 	{
@@ -654,7 +646,10 @@ static void CreateFramebuffers(swap_chain* Swapchain, VkDevice Device, VkRenderP
 	}
 }
 
-static swap_chain CreateSwapChain(physical_device_deets* DeviceDeets, VkDevice LogicalDevice, GLFWwindow* Window, VkSurfaceKHR Surface)
+static swap_chain CreateSwapChain(physical_device_deets* DeviceDeets,
+								  VkDevice LogicalDevice,
+								  GLFWwindow* Window,
+								  VkSurfaceKHR Surface)
 {
 	swap_chain Result = {};
 
@@ -696,7 +691,6 @@ static swap_chain CreateSwapChain(physical_device_deets* DeviceDeets, VkDevice L
 		vkGetSwapchainImagesKHR(LogicalDevice, Result.Handle, &Result.NumImages, nullptr);
 		Result.Images = AllocArray(VkImage, Result.NumImages);
 		vkGetSwapchainImagesKHR(LogicalDevice, Result.Handle, &Result.NumImages, Result.Images);
-
 		Result.ImageViews = AllocArray(VkImageView, Result.NumImages);
 		for (u32 i = 0; i < Result.NumImages; i++)
 		{
@@ -953,7 +947,7 @@ static VkCommandPool CreateCommandPool(VkDevice Device, u32 QueueFamilyIndex)
 	{
 		.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
 		.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
-		.queueFamilyIndex = QueueFamilyIndex
+		.queueFamilyIndex = QueueFamilyIndex,
 	};
 	VkCommandPool Result = VK_NULL_HANDLE;
 	if (vkCreateCommandPool(Device, &PoolInfo, nullptr, &Result) != VK_SUCCESS) // pAllocator
@@ -964,20 +958,23 @@ static VkCommandPool CreateCommandPool(VkDevice Device, u32 QueueFamilyIndex)
 	return Result;
 }
 
-static VkCommandBuffer CreateCommandBuffer(VkDevice Device, VkCommandPool CommandPool)
+// TODO: How is this different from the number of Swapchain image views??
+static constexpr u32 MAX_FRAMES_IN_FLIGHT = 2;
+
+static VkCommandBuffer* CreateCommandBuffers(VkDevice Device, VkCommandPool CommandPool)
 {
 	VkCommandBufferAllocateInfo AllocInfo
 	{
 		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
 		.commandPool = CommandPool,
 		.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-		.commandBufferCount = 1
+		.commandBufferCount = MAX_FRAMES_IN_FLIGHT,
 	};
-	VkCommandBuffer Result = VK_NULL_HANDLE;
+	VkCommandBuffer* Result = AllocArray(VkCommandBuffer, MAX_FRAMES_IN_FLIGHT);
 	// TODO: Does this just allocate GPU memory (in some opaque way), hence why we're not passing a pAllocator?
-	if (vkAllocateCommandBuffers(Device, &AllocInfo, &Result) != VK_SUCCESS)
+	if (vkAllocateCommandBuffers(Device, &AllocInfo, Result) != VK_SUCCESS)
 	{
-		fprintf(stderr, "Failed to allocate a command buffer my dudes\n");
+		fprintf(stderr, "Failed to allocate command buffers my dudes\n");
 		Assert(false);
 	}
 	return Result;
@@ -991,14 +988,34 @@ struct vulkan_stuff
 	VkQueue GraphicsQueue;
 	VkRenderPass RenderPass;
 	VkCommandPool CommandPool;
-	VkCommandBuffer CommandBuffer;
+	VkCommandBuffer* CommandBuffers; // MAX_FRAMES_IN_FLIGHT of these
 	swap_chain Swapchain;
 	vulkan_pipeline Pipeline;
+	physical_device_deets PhysicalDevice;
 
-	VkSemaphore ImageAvailableSemaphore;
-	VkSemaphore RenderFinishedSempaphore;
-	VkFence InFlightFence;
+	VkSemaphore* ImageAvailableSemaphores;
+	VkSemaphore* RenderFinishedSempaphores;
+	VkFence* InFlightFences;
+
+	u32 CurrentFrame;
+	b32 PendingFramebufferResize;
 };
+
+static void OnWindowResized(GLFWwindow* Window, s32 Width, s32 Height)
+{
+	vulkan_stuff* VulkanStuff = (vulkan_stuff*)glfwGetWindowUserPointer(Window);
+	VulkanStuff->PendingFramebufferResize = true;
+}
+
+static GLFWwindow* InitWindow()
+{
+	glfwInit();
+	glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
+	//glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
+	GLFWwindow* Window = glfwCreateWindow(800, 600, "This is a window, mate", nullptr, nullptr);
+	glfwSetFramebufferSizeCallback(Window, OnWindowResized);
+	return Window;
+}
 
 static void CreateSyncObjects(vulkan_stuff* OutVulkanStuff)
 {
@@ -1011,13 +1028,64 @@ static void CreateSyncObjects(vulkan_stuff* OutVulkanStuff)
 		.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
 		.flags = VK_FENCE_CREATE_SIGNALED_BIT,
 	};
-	if (vkCreateSemaphore(OutVulkanStuff->Device, &SempahoreInfo, nullptr, &OutVulkanStuff->ImageAvailableSemaphore) != VK_SUCCESS || // pAllocator
-		vkCreateSemaphore(OutVulkanStuff->Device, &SempahoreInfo, nullptr, &OutVulkanStuff->RenderFinishedSempaphore) != VK_SUCCESS || // pAllocator
-		vkCreateFence(OutVulkanStuff->Device, &FenceInfo, nullptr, &OutVulkanStuff->InFlightFence) != VK_SUCCESS) // pAllocator
+
+	OutVulkanStuff->ImageAvailableSemaphores = AllocArray(VkSemaphore, MAX_FRAMES_IN_FLIGHT);
+	OutVulkanStuff->RenderFinishedSempaphores = AllocArray(VkSemaphore, MAX_FRAMES_IN_FLIGHT);
+	OutVulkanStuff->InFlightFences = AllocArray(VkFence, MAX_FRAMES_IN_FLIGHT);
+
+	for (u32 i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
 	{
-		fprintf(stderr, "Failed to create them semaphores and/or fences mate\n");
-		Assert(false);
+		if (vkCreateSemaphore(OutVulkanStuff->Device, &SempahoreInfo, nullptr, OutVulkanStuff->ImageAvailableSemaphores + i) != VK_SUCCESS || // pAllocator
+			vkCreateSemaphore(OutVulkanStuff->Device, &SempahoreInfo, nullptr, OutVulkanStuff->RenderFinishedSempaphores + i) != VK_SUCCESS || // pAllocator
+			vkCreateFence(OutVulkanStuff->Device, &FenceInfo, nullptr, OutVulkanStuff->InFlightFences + i) != VK_SUCCESS) // pAllocator
+		{
+			fprintf(stderr, "Failed to create them semaphores and/or fences mate\n");
+			Assert(false);
+		}
 	}
+}
+
+static void CleanUpSwapchain(VkDevice Device, swap_chain* Swapchain)
+{
+	for (u32 i = 0; i < Swapchain->NumImages; i++)
+	{
+		vkDestroyFramebuffer(Device, Swapchain->Framebuffers[i], nullptr); // pAllocator
+	}
+	free(Swapchain->Framebuffers);
+
+	for (u32 i = 0; i < Swapchain->NumImages; i++)
+	{
+		vkDestroyImageView(Device, Swapchain->ImageViews[i], nullptr); // pAllocator
+	}
+	free(Swapchain->ImageViews);
+	free(Swapchain->Images);
+
+	vkDestroySwapchainKHR(Device, Swapchain->Handle, nullptr); // pAllocator
+}
+
+static void RecreateSwapchain(vulkan_stuff* VulkanStuff, GLFWwindow* Window)
+{
+	s32 Width, Height;
+	glfwGetFramebufferSize(Window, &Width, &Height);
+	// TODO: This spinlock is gross - there must surely be a better way
+	while (Width == 0 || Height == 0)
+	{
+		glfwGetFramebufferSize(Window, &Width, &Height);
+		glfwWaitEvents();
+	}
+
+	vkDeviceWaitIdle(VulkanStuff->Device);
+
+	// TODO: Slightly piggy - we just need to retrieve the updated framebuffer size here...
+	vkGetPhysicalDeviceSurfaceCapabilitiesKHR(VulkanStuff->PhysicalDevice.Handle,
+											  VulkanStuff->Surface,
+											  &VulkanStuff->PhysicalDevice.SwapChainDeets.Capabilities);
+	
+	CleanUpSwapchain(VulkanStuff->Device, &VulkanStuff->Swapchain);
+
+	VulkanStuff->Swapchain = CreateSwapChain(&VulkanStuff->PhysicalDevice, VulkanStuff->Device, Window, VulkanStuff->Surface);
+
+	CreateFramebuffers(&VulkanStuff->Swapchain, VulkanStuff->Device, VulkanStuff->RenderPass);
 }
 
 static vulkan_stuff InitVulkan(GLFWwindow* Window)
@@ -1026,15 +1094,15 @@ static vulkan_stuff InitVulkan(GLFWwindow* Window)
 
 	Result.Instance = CreateInstance();
 	Result.Surface = CreateSurface(Result.Instance, Window);
-	physical_device_deets PhysicalDevice = PickPhysicalDevice(Result.Instance, Result.Surface);
-	Result.Device = CreateLogicalDevice(PhysicalDevice);
-	vkGetDeviceQueue(Result.Device, PhysicalDevice.QueueFamilyIndices.GraphicsFamily, 0, &Result.GraphicsQueue);
-	Result.Swapchain = CreateSwapChain(&PhysicalDevice, Result.Device, Window, Result.Surface);
+	Result.PhysicalDevice = PickPhysicalDevice(Result.Instance, Result.Surface);
+	Result.Device = CreateLogicalDevice(Result.PhysicalDevice);
+	vkGetDeviceQueue(Result.Device, Result.PhysicalDevice.QueueFamilyIndices.GraphicsFamily, 0, &Result.GraphicsQueue);
+	Result.Swapchain = CreateSwapChain(&Result.PhysicalDevice, Result.Device, Window, Result.Surface);
 	Result.RenderPass = CreateRenderPass(Result.Device, &Result.Swapchain);
 	Result.Pipeline = CreateGraphicsPipeline(Result.Device, &Result.Swapchain, Result.RenderPass);
 	CreateFramebuffers(&Result.Swapchain, Result.Device, Result.RenderPass);
-	Result.CommandPool = CreateCommandPool(Result.Device, PhysicalDevice.QueueFamilyIndices.GraphicsFamily);
-	Result.CommandBuffer = CreateCommandBuffer(Result.Device, Result.CommandPool);
+	Result.CommandPool = CreateCommandPool(Result.Device, Result.PhysicalDevice.QueueFamilyIndices.GraphicsFamily);
+	Result.CommandBuffers = CreateCommandBuffers(Result.Device, Result.CommandPool);
 	CreateSyncObjects(&Result);
 
 	return Result;
@@ -1046,7 +1114,8 @@ static void RecordCommandBuffer(vulkan_stuff* VulkanStuff, u32 ImageIndex)
 	{
 		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO
 	};
-	if (vkBeginCommandBuffer(VulkanStuff->CommandBuffer, &BeginInfo) == VK_SUCCESS)
+	VkCommandBuffer CommandBuffer = VulkanStuff->CommandBuffers[VulkanStuff->CurrentFrame];
+	if (vkBeginCommandBuffer(CommandBuffer, &BeginInfo) == VK_SUCCESS)
 	{
 		VkClearValue ClearColour { .color = { 0.0f, 0.0f, 0.0f, 1.0f } };
 		Assert(ImageIndex < VulkanStuff->Swapchain.NumImages);
@@ -1059,8 +1128,8 @@ static void RecordCommandBuffer(vulkan_stuff* VulkanStuff, u32 ImageIndex)
 			.clearValueCount = 1,
 			.pClearValues = &ClearColour
 		};
-		vkCmdBeginRenderPass(VulkanStuff->CommandBuffer, &RenderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
-		vkCmdBindPipeline(VulkanStuff->CommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, VulkanStuff->Pipeline.Handle);
+		vkCmdBeginRenderPass(CommandBuffer, &RenderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
+		vkCmdBindPipeline(CommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, VulkanStuff->Pipeline.Handle);
 		
 		VkViewport Viewport
 		{
@@ -1071,16 +1140,16 @@ static void RecordCommandBuffer(vulkan_stuff* VulkanStuff, u32 ImageIndex)
 			.minDepth = 0.0f,
 			.maxDepth = 1.0f,
 		};
-		vkCmdSetViewport(VulkanStuff->CommandBuffer, 0, 1, &Viewport);
+		vkCmdSetViewport(CommandBuffer, 0, 1, &Viewport);
 
 		VkRect2D Scissor { .extent = VulkanStuff->Swapchain.Extents };
-		vkCmdSetScissor(VulkanStuff->CommandBuffer, 0, 1, &Scissor);
+		vkCmdSetScissor(CommandBuffer, 0, 1, &Scissor);
 
-		vkCmdDraw(VulkanStuff->CommandBuffer, 3, 1, 0, 0);
+		vkCmdDraw(CommandBuffer, 3, 1, 0, 0);
 
-		vkCmdEndRenderPass(VulkanStuff->CommandBuffer);
+		vkCmdEndRenderPass(CommandBuffer);
 
-		if (vkEndCommandBuffer(VulkanStuff->CommandBuffer) != VK_SUCCESS)
+		if (vkEndCommandBuffer(CommandBuffer) != VK_SUCCESS)
 		{
 			fprintf(stderr, "Failed to end/record command buffer\n");
 			Assert(false);
@@ -1093,49 +1162,79 @@ static void RecordCommandBuffer(vulkan_stuff* VulkanStuff, u32 ImageIndex)
 	}
 }
 
-static void DrawFrame(vulkan_stuff* VulkanStuff)
+static void DrawFrame(vulkan_stuff* VulkanStuff, GLFWwindow* Window)
 {
-	vkWaitForFences(VulkanStuff->Device, 1, &VulkanStuff->InFlightFence, VK_TRUE, UINT64_MAX);
-	vkResetFences(VulkanStuff->Device, 1, &VulkanStuff->InFlightFence);
+	vkWaitForFences(VulkanStuff->Device, 1, VulkanStuff->InFlightFences + VulkanStuff->CurrentFrame, VK_TRUE, UINT64_MAX);
 
 	u32 ImageIndex;
 	// Sooo... the ImageIndex is written to immediately, but the image may in fact not be available to use until the semaphore has signalled..?
-	vkAcquireNextImageKHR(VulkanStuff->Device, VulkanStuff->Swapchain.Handle, UINT64_MAX, VulkanStuff->ImageAvailableSemaphore, VK_NULL_HANDLE, &ImageIndex);
-
-	vkResetCommandBuffer(VulkanStuff->CommandBuffer, 0);
-	RecordCommandBuffer(VulkanStuff, ImageIndex);
-
-	VkPipelineStageFlags WaitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-	VkSubmitInfo SubmitInfo
+	VkResult CallResult = vkAcquireNextImageKHR(VulkanStuff->Device,
+												VulkanStuff->Swapchain.Handle,
+												UINT64_MAX,
+												VulkanStuff->ImageAvailableSemaphores[VulkanStuff->CurrentFrame],
+												VK_NULL_HANDLE,
+												&ImageIndex);
+	if (CallResult == VK_ERROR_OUT_OF_DATE_KHR)
 	{
-		.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-		.waitSemaphoreCount = 1,
-		.pWaitSemaphores = &VulkanStuff->ImageAvailableSemaphore,
-		.pWaitDstStageMask = &WaitStage,
-		.commandBufferCount = 1,
-		.pCommandBuffers = &VulkanStuff->CommandBuffer,
-		.signalSemaphoreCount = 1,
-		.pSignalSemaphores = &VulkanStuff->RenderFinishedSempaphore,
-	};
-
-	if (vkQueueSubmit(VulkanStuff->GraphicsQueue, 1, &SubmitInfo, VulkanStuff->InFlightFence) == VK_SUCCESS)
+		RecreateSwapchain(VulkanStuff, Window);
+	}
+	else if (CallResult != VK_SUCCESS && CallResult != VK_SUBOPTIMAL_KHR)
 	{
-		VkPresentInfoKHR PresentInfo
-		{
-			.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
-			.waitSemaphoreCount = 1,
-			.pWaitSemaphores = &VulkanStuff->RenderFinishedSempaphore,
-			.swapchainCount = 1,
-			.pSwapchains = &VulkanStuff->Swapchain.Handle,
-			.pImageIndices = &ImageIndex,
-		};
-		vkQueuePresentKHR(VulkanStuff->GraphicsQueue, &PresentInfo);
+		fprintf(stderr, "Failed to acquire image for drawing...\n");
+		Assert(false);
 	}
 	else
 	{
-		fprintf(stderr, "Couldn't submit draw command buffer\n");
-		Assert(false);
+		vkResetFences(VulkanStuff->Device, 1, VulkanStuff->InFlightFences + VulkanStuff->CurrentFrame);
+
+		vkResetCommandBuffer(VulkanStuff->CommandBuffers[VulkanStuff->CurrentFrame], 0);
+		RecordCommandBuffer(VulkanStuff, ImageIndex);
+
+		VkPipelineStageFlags WaitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+		VkSubmitInfo SubmitInfo
+		{
+			.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+			.waitSemaphoreCount = 1,
+			.pWaitSemaphores = VulkanStuff->ImageAvailableSemaphores + VulkanStuff->CurrentFrame,
+			.pWaitDstStageMask = &WaitStage,
+			.commandBufferCount = 1,
+			.pCommandBuffers = VulkanStuff->CommandBuffers + VulkanStuff->CurrentFrame,
+			.signalSemaphoreCount = 1,
+			.pSignalSemaphores = VulkanStuff->RenderFinishedSempaphores + VulkanStuff->CurrentFrame,
+		};
+
+		if (vkQueueSubmit(VulkanStuff->GraphicsQueue, 1, &SubmitInfo, VulkanStuff->InFlightFences[VulkanStuff->CurrentFrame]) == VK_SUCCESS)
+		{
+			VkPresentInfoKHR PresentInfo
+			{
+				.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+				.waitSemaphoreCount = 1,
+				.pWaitSemaphores = VulkanStuff->RenderFinishedSempaphores + VulkanStuff->CurrentFrame,
+				.swapchainCount = 1,
+				.pSwapchains = &VulkanStuff->Swapchain.Handle,
+				.pImageIndices = &ImageIndex,
+			};
+			CallResult = vkQueuePresentKHR(VulkanStuff->GraphicsQueue, &PresentInfo);
+			if (CallResult == VK_ERROR_OUT_OF_DATE_KHR || CallResult == VK_SUBOPTIMAL_KHR || VulkanStuff->PendingFramebufferResize)
+			{
+				VulkanStuff->PendingFramebufferResize = false;
+				RecreateSwapchain(VulkanStuff, Window);
+			}
+			else if (CallResult != VK_SUCCESS)
+			{
+				fprintf(stderr, "Failed to queue image for presentation (whatever that means)\n");
+				Assert(false);
+			}
+
+			VulkanStuff->CurrentFrame = (VulkanStuff->CurrentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
+		}
+		else
+		{
+			fprintf(stderr, "Couldn't submit draw command buffer\n");
+			Assert(false);
+		}
 	}
+
 }
 
 static void MainLoop(GLFWwindow* Window, vulkan_stuff* VulkanStuff)
@@ -1143,7 +1242,7 @@ static void MainLoop(GLFWwindow* Window, vulkan_stuff* VulkanStuff)
 	while (!glfwWindowShouldClose(Window))
 	{
 		glfwPollEvents();
-		DrawFrame(VulkanStuff);
+		DrawFrame(VulkanStuff, Window);
 	}
 
 	vkDeviceWaitIdle(VulkanStuff->Device);
@@ -1154,23 +1253,17 @@ static void CleanUp(GLFWwindow* Window, vulkan_stuff* VulkanStuff)
 #if _DEBUG
 	DestroyDebugCallback(VulkanStuff->Instance);
 #endif
-	vkDestroySemaphore(VulkanStuff->Device, VulkanStuff->ImageAvailableSemaphore, nullptr); // pAllocator
-	vkDestroySemaphore(VulkanStuff->Device, VulkanStuff->RenderFinishedSempaphore, nullptr); // pAllocator
-	vkDestroyFence(VulkanStuff->Device, VulkanStuff->InFlightFence, nullptr); // pAllocator
-	vkDestroyCommandPool(VulkanStuff->Device, VulkanStuff->CommandPool, nullptr); // pAllocator
-	for (u32 i = 0; i < VulkanStuff->Swapchain.NumImages; i++)
+	CleanUpSwapchain(VulkanStuff->Device, &VulkanStuff->Swapchain);
+	for (u32 i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
 	{
-		vkDestroyFramebuffer(VulkanStuff->Device, VulkanStuff->Swapchain.Framebuffers[i], nullptr); // pAllocator
+		vkDestroySemaphore(VulkanStuff->Device, VulkanStuff->ImageAvailableSemaphores[i], nullptr); // pAllocator
+		vkDestroySemaphore(VulkanStuff->Device, VulkanStuff->RenderFinishedSempaphores[i], nullptr); // pAllocator
+		vkDestroyFence(VulkanStuff->Device, VulkanStuff->InFlightFences[i], nullptr); // pAllocator
 	}
+	vkDestroyCommandPool(VulkanStuff->Device, VulkanStuff->CommandPool, nullptr); // pAllocator
 	vkDestroyPipeline(VulkanStuff->Device, VulkanStuff->Pipeline.Handle, nullptr); // pAllocator
 	vkDestroyPipelineLayout(VulkanStuff->Device, VulkanStuff->Pipeline.Layout, nullptr); // pAllocator
 	vkDestroyRenderPass(VulkanStuff->Device, VulkanStuff->RenderPass, nullptr); // pAllocator
-	for (u32 i = 0; i < VulkanStuff->Swapchain.NumImages; i++)
-	{
-		vkDestroyImageView(VulkanStuff->Device, VulkanStuff->Swapchain.ImageViews[i], nullptr); // pAllocator
-	}
-
-	vkDestroySwapchainKHR(VulkanStuff->Device, VulkanStuff->Swapchain.Handle, nullptr); // pAllocator
 	vkDestroyDevice(VulkanStuff->Device, nullptr); // pAllocator
 	vkDestroySurfaceKHR(VulkanStuff->Instance, VulkanStuff->Surface, nullptr); // pAllocator
 	vkDestroyInstance(VulkanStuff->Instance, nullptr); // pAllocator
@@ -1182,6 +1275,7 @@ int main()
 {
 	GLFWwindow* Window = InitWindow();
 	vulkan_stuff VulkanStuff = InitVulkan(Window);
+	glfwSetWindowUserPointer(Window, &VulkanStuff);
 	MainLoop(Window, &VulkanStuff);
 	CleanUp(Window, &VulkanStuff);
 }
