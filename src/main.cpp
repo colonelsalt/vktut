@@ -9,6 +9,8 @@
 #include <cstdlib>
 #include <cstring>
 
+#include <glm/glm.hpp>
+
 typedef int8_t s8;
 typedef uint8_t u8;
 typedef uint32_t u32;
@@ -35,6 +37,58 @@ static u32 Clamp(u32 Value, u32 Min, u32 Max)
 	}
 	return Result;
 }
+
+struct vertex
+{
+	glm::vec2 Position;
+	glm::vec3 Colour;
+
+	static VkVertexInputBindingDescription GetBindingDescription()
+	{
+		VkVertexInputBindingDescription Result
+		{
+			.binding = 0,
+			.stride = sizeof(vertex),
+			.inputRate = VK_VERTEX_INPUT_RATE_VERTEX
+		};
+		return Result;
+	}
+
+	struct attr_desc
+	{
+		static constexpr u32 Size = 2;
+		VkVertexInputAttributeDescription Data[Size];
+	};
+	static attr_desc GetAttributeDescriptions()
+	{
+		attr_desc Result
+		{
+			.Data
+			{
+				{
+					.location = 0,
+					.binding = 0,
+					.format = VK_FORMAT_R32G32B32_SFLOAT,
+					.offset = offsetof(vertex, Position)
+				},
+				{
+					.location = 1,
+					.binding = 0,
+					.format = VK_FORMAT_R32G32B32_SFLOAT,
+					.offset = offsetof(vertex, Colour)
+				}
+			}
+		};
+		return Result;
+	}
+};
+
+static const vertex s_Vertices[]
+{
+	{.Position = { 0.0f, -0.5f}, .Colour = {1.0f, 0.0f, 0.0f}},
+	{.Position = { 0.5f,  0.5f}, .Colour = {0.0f, 1.0f, 0.0f}},
+	{.Position = {-0.5f,  0.5f}, .Colour = {0.0f, 0.0f, 1.0f}}
+};
 
 struct file_buffer
 {
@@ -828,9 +882,16 @@ static vulkan_pipeline CreateGraphicsPipeline(VkDevice Device, swap_chain* Swapc
 		.pDynamicStates = DYNAMIC_STATES
 	};
 
+	VkVertexInputBindingDescription BindingDesc = vertex::GetBindingDescription();
+	vertex::attr_desc AttrDesc = vertex::GetAttributeDescriptions();
+
 	VkPipelineVertexInputStateCreateInfo VertextInputInfo
 	{
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+		.vertexBindingDescriptionCount = 1,
+		.pVertexBindingDescriptions = &BindingDesc,
+		.vertexAttributeDescriptionCount = AttrDesc.Size,
+		.pVertexAttributeDescriptions = AttrDesc.Data,
 	};
 
 	VkPipelineInputAssemblyStateCreateInfo InputAssembly
@@ -1063,6 +1124,11 @@ static void CleanUpSwapchain(VkDevice Device, swap_chain* Swapchain)
 	vkDestroySwapchainKHR(Device, Swapchain->Handle, nullptr); // pAllocator
 }
 
+// TODO: Getting some ugly artefacts here: Framebuffer actually does not resize until user has 'let go' of the mouse drag;
+// while dragging everything looks messed up. May be an issue with GLFW event polling - when I move to doing native Win32
+// this should be fixed. Possibly relevant links:
+// - Reddit discussion: https://www.reddit.com/r/vulkan/comments/174yy9b/smooth_window_resize_help/
+// - vkCube source code: https://github.com/KhronosGroup/Vulkan-Tools/blob/main/cube/cube.c
 static void RecreateSwapchain(vulkan_stuff* VulkanStuff, GLFWwindow* Window)
 {
 	s32 Width, Height;
