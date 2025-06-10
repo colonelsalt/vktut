@@ -83,12 +83,32 @@ struct vertex
 	}
 };
 
-static const vertex s_Vertices[]
+static constexpr u32 NUM_VERTICES = 3;
+static const vertex s_Vertices[NUM_VERTICES]
 {
 	{.Position = { 0.0f, -0.5f}, .Colour = {1.0f, 0.0f, 0.0f}},
 	{.Position = { 0.5f,  0.5f}, .Colour = {0.0f, 1.0f, 0.0f}},
 	{.Position = {-0.5f,  0.5f}, .Colour = {0.0f, 0.0f, 1.0f}}
 };
+
+static u32 FindMemoryType(u32 TypeFilter, VkMemoryPropertyFlags Properties, VkPhysicalDevice PhysicalDevice)
+{
+	VkPhysicalDeviceMemoryProperties MemoryProperties;
+	vkGetPhysicalDeviceMemoryProperties(PhysicalDevice, &MemoryProperties);
+
+	for (u32 i = 0; i < MemoryProperties.memoryTypeCount; i++)
+	{
+		VkMemoryType MemType = MemoryProperties.memoryTypes[i];
+		if ((TypeFilter & (1 << i)) &&
+			(MemType.propertyFlags & Properties) == Properties)
+		{
+			return i;
+		}
+	}
+	fprintf(stderr, "Failed to find suitable memory type\n");
+	Assert(false);
+	return 0;
+}
 
 struct file_buffer
 {
@@ -1041,6 +1061,61 @@ static VkCommandBuffer* CreateCommandBuffers(VkDevice Device, VkCommandPool Comm
 	return Result;
 }
 
+struct vertex_buffer
+{
+	VkBuffer Handle;
+	VkDeviceMemory Memory;
+};
+
+static vertex_buffer CreateVertexBuffer(VkDevice Device, VkPhysicalDevice PhysicalDevice)
+{
+	VkBufferCreateInfo BufferInfo
+	{
+		.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+		.size = sizeof(vertex) * NUM_VERTICES,
+		.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+		.sharingMode = VK_SHARING_MODE_EXCLUSIVE
+	};
+
+	vertex_buffer Result = {};
+	if (vkCreateBuffer(Device, &BufferInfo, nullptr, &Result.Handle) == VK_SUCCESS) // pAllocator
+	{
+		VkMemoryRequirements MemRequirements;
+		vkGetBufferMemoryRequirements(Device, Result.Handle, &MemRequirements);
+
+		u32 MemoryIndex = FindMemoryType(MemRequirements.memoryTypeBits,
+										 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+										 PhysicalDevice);
+		VkMemoryAllocateInfo AllocInfo
+		{
+			.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+			.allocationSize = MemRequirements.size,
+			.memoryTypeIndex = MemoryIndex,
+		};
+
+		if (vkAllocateMemory(Device, &AllocInfo, nullptr, &Result.Memory) == VK_SUCCESS) // pAllocator
+		{
+			vkBindBufferMemory(Device, Result.Handle, Result.Memory, 0);
+
+			void* UserBuffer;
+			vkMapMemory(Device, Result.Memory, 0, BufferInfo.size, 0, &UserBuffer);
+			memcpy(UserBuffer, s_Vertices, BufferInfo.size);
+			vkUnmapMemory(Device, Result.Memory);
+		}
+		else
+		{
+			fprintf(stderr, "Failed to allocate vertex buffer memory.\n");
+			Assert(false);
+		}
+	}
+	else
+	{
+		fprintf(stderr, "Failed to create vertex buffer.\n");
+		Assert(false);
+	}
+	return Result;
+}
+
 struct vulkan_stuff
 {
 	VkInstance Instance;
@@ -1057,6 +1132,8 @@ struct vulkan_stuff
 	VkSemaphore* ImageAvailableSemaphores;
 	VkSemaphore* RenderFinishedSempaphores;
 	VkFence* InFlightFences;
+
+	vertex_buffer VertexBuffer;
 
 	u32 CurrentFrame;
 	b32 PendingFramebufferResize;
@@ -1168,6 +1245,7 @@ static vulkan_stuff InitVulkan(GLFWwindow* Window)
 	Result.Pipeline = CreateGraphicsPipeline(Result.Device, &Result.Swapchain, Result.RenderPass);
 	CreateFramebuffers(&Result.Swapchain, Result.Device, Result.RenderPass);
 	Result.CommandPool = CreateCommandPool(Result.Device, Result.PhysicalDevice.QueueFamilyIndices.GraphicsFamily);
+	Result.VertexBuffer = CreateVertexBuffer(Result.Device, Result.PhysicalDevice.Handle);
 	Result.CommandBuffers = CreateCommandBuffers(Result.Device, Result.CommandPool);
 	CreateSyncObjects(&Result);
 
@@ -1197,6 +1275,9 @@ static void RecordCommandBuffer(vulkan_stuff* VulkanStuff, u32 ImageIndex)
 		vkCmdBeginRenderPass(CommandBuffer, &RenderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
 		vkCmdBindPipeline(CommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, VulkanStuff->Pipeline.Handle);
 		
+		VkDeviceSize VertexOffset = 0;
+		vkCmdBindVertexBuffers(CommandBuffer, 0, 1, &VulkanStuff->VertexBuffer.Handle, &VertexOffset);
+
 		VkViewport Viewport
 		{
 			.x = 0.0f,
@@ -1211,7 +1292,7 @@ static void RecordCommandBuffer(vulkan_stuff* VulkanStuff, u32 ImageIndex)
 		VkRect2D Scissor { .extent = VulkanStuff->Swapchain.Extents };
 		vkCmdSetScissor(CommandBuffer, 0, 1, &Scissor);
 
-		vkCmdDraw(CommandBuffer, 3, 1, 0, 0);
+		vkCmdDraw(CommandBuffer, NUM_VERTICES, 1, 0, 0);
 
 		vkCmdEndRenderPass(CommandBuffer);
 
@@ -1320,6 +1401,8 @@ static void CleanUp(GLFWwindow* Window, vulkan_stuff* VulkanStuff)
 	DestroyDebugCallback(VulkanStuff->Instance);
 #endif
 	CleanUpSwapchain(VulkanStuff->Device, &VulkanStuff->Swapchain);
+	vkDestroyBuffer(VulkanStuff->Device, VulkanStuff->VertexBuffer.Handle, nullptr); // pAllocator
+	vkFreeMemory(VulkanStuff->Device, VulkanStuff->VertexBuffer.Memory, nullptr); // pAllocator
 	for (u32 i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
 	{
 		vkDestroySemaphore(VulkanStuff->Device, VulkanStuff->ImageAvailableSemaphores[i], nullptr); // pAllocator
