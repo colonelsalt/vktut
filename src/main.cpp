@@ -1061,30 +1061,34 @@ static VkCommandBuffer* CreateCommandBuffers(VkDevice Device, VkCommandPool Comm
 	return Result;
 }
 
-struct vertex_buffer
+struct vulkan_buffer
 {
 	VkBuffer Handle;
 	VkDeviceMemory Memory;
 };
 
-static vertex_buffer CreateVertexBuffer(VkDevice Device, VkPhysicalDevice PhysicalDevice)
+static vulkan_buffer CreateBuffer(VkDevice Device, 
+								  VkPhysicalDevice PhysicalDevice, 
+								  VkDeviceSize Size, 
+								  VkBufferUsageFlags UsageFlags, 
+								  VkMemoryPropertyFlags PropertyFlags)
 {
 	VkBufferCreateInfo BufferInfo
 	{
 		.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-		.size = sizeof(vertex) * NUM_VERTICES,
-		.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+		.size = Size,
+		.usage = UsageFlags,
 		.sharingMode = VK_SHARING_MODE_EXCLUSIVE
 	};
 
-	vertex_buffer Result = {};
+	vulkan_buffer Result = {};
 	if (vkCreateBuffer(Device, &BufferInfo, nullptr, &Result.Handle) == VK_SUCCESS) // pAllocator
 	{
 		VkMemoryRequirements MemRequirements;
 		vkGetBufferMemoryRequirements(Device, Result.Handle, &MemRequirements);
 
 		u32 MemoryIndex = FindMemoryType(MemRequirements.memoryTypeBits,
-										 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+										 PropertyFlags,
 										 PhysicalDevice);
 		VkMemoryAllocateInfo AllocInfo
 		{
@@ -1096,23 +1100,84 @@ static vertex_buffer CreateVertexBuffer(VkDevice Device, VkPhysicalDevice Physic
 		if (vkAllocateMemory(Device, &AllocInfo, nullptr, &Result.Memory) == VK_SUCCESS) // pAllocator
 		{
 			vkBindBufferMemory(Device, Result.Handle, Result.Memory, 0);
-
-			void* UserBuffer;
-			vkMapMemory(Device, Result.Memory, 0, BufferInfo.size, 0, &UserBuffer);
-			memcpy(UserBuffer, s_Vertices, BufferInfo.size);
-			vkUnmapMemory(Device, Result.Memory);
 		}
 		else
 		{
-			fprintf(stderr, "Failed to allocate vertex buffer memory.\n");
+			fprintf(stderr, "Failed to allocate buffer memory.\n");
 			Assert(false);
 		}
 	}
 	else
 	{
-		fprintf(stderr, "Failed to create vertex buffer.\n");
+		fprintf(stderr, "Failed to create buffer.\n");
 		Assert(false);
 	}
+	return Result;
+}
+
+static void CopyBuffer(VkBuffer SrcBuffer, VkBuffer DestBuffer, VkDeviceSize Size, VkDevice Device, VkCommandPool CommandPool, VkQueue GraphicsQueue)
+{
+	VkCommandBufferAllocateInfo AllocInfo
+	{
+		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+		.commandPool = CommandPool,
+		.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+		.commandBufferCount = 1,
+	};
+
+	VkCommandBuffer CommandBuffer;
+	vkAllocateCommandBuffers(Device, &AllocInfo, &CommandBuffer);
+
+	VkCommandBufferBeginInfo BeginInfo
+	{
+		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+		.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+	};
+	vkBeginCommandBuffer(CommandBuffer, &BeginInfo);
+
+	VkBufferCopy CopyRegion
+	{
+		.size = Size
+	};
+	vkCmdCopyBuffer(CommandBuffer, SrcBuffer, DestBuffer, 1, &CopyRegion);
+	vkEndCommandBuffer(CommandBuffer);
+
+	VkSubmitInfo SubmitInfo
+	{
+		.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+		.commandBufferCount = 1,
+		.pCommandBuffers = &CommandBuffer,
+	};
+	vkQueueSubmit(GraphicsQueue, 1, &SubmitInfo, VK_NULL_HANDLE);
+	vkQueueWaitIdle(GraphicsQueue);
+
+	vkFreeCommandBuffers(Device, CommandPool, 1, &CommandBuffer);
+}
+
+static vulkan_buffer CreateVertexBuffer(VkDevice Device, VkPhysicalDevice PhysicalDevice, VkCommandPool CommandPool, VkQueue GraphicsQueue)
+{
+	VkDeviceSize BufferSize = sizeof(vertex) * NUM_VERTICES;
+	vulkan_buffer StagingBuffer = CreateBuffer(Device, 
+											   PhysicalDevice,
+											   BufferSize,
+											   VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+											   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+	void* UserBuffer;
+	vkMapMemory(Device, StagingBuffer.Memory, 0, BufferSize, 0, &UserBuffer);
+	memcpy(UserBuffer, s_Vertices, BufferSize);
+	vkUnmapMemory(Device, StagingBuffer.Memory);
+
+	vulkan_buffer Result = CreateBuffer(Device, 
+										PhysicalDevice, 
+										BufferSize, 
+										VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, 
+										VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+	CopyBuffer(StagingBuffer.Handle, Result.Handle, BufferSize, Device, CommandPool, GraphicsQueue);
+	
+	vkDestroyBuffer(Device, StagingBuffer.Handle, nullptr); // pAllocator
+	vkFreeMemory(Device, StagingBuffer.Memory, nullptr); // pAllocator
+
 	return Result;
 }
 
@@ -1133,7 +1198,7 @@ struct vulkan_stuff
 	VkSemaphore* RenderFinishedSempaphores;
 	VkFence* InFlightFences;
 
-	vertex_buffer VertexBuffer;
+	vulkan_buffer VertexBuffer;
 
 	u32 CurrentFrame;
 	b32 PendingFramebufferResize;
@@ -1245,7 +1310,7 @@ static vulkan_stuff InitVulkan(GLFWwindow* Window)
 	Result.Pipeline = CreateGraphicsPipeline(Result.Device, &Result.Swapchain, Result.RenderPass);
 	CreateFramebuffers(&Result.Swapchain, Result.Device, Result.RenderPass);
 	Result.CommandPool = CreateCommandPool(Result.Device, Result.PhysicalDevice.QueueFamilyIndices.GraphicsFamily);
-	Result.VertexBuffer = CreateVertexBuffer(Result.Device, Result.PhysicalDevice.Handle);
+	Result.VertexBuffer = CreateVertexBuffer(Result.Device, Result.PhysicalDevice.Handle, Result.CommandPool, Result.GraphicsQueue);
 	Result.CommandBuffers = CreateCommandBuffers(Result.Device, Result.CommandPool);
 	CreateSyncObjects(&Result);
 
