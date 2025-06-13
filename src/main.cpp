@@ -9,7 +9,10 @@
 #include <cstdlib>
 #include <cstring>
 
+#define GLM_FORCE_RADIANS
 #include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+#include <chrono>
 
 typedef int8_t s8;
 typedef uint8_t u8;
@@ -96,6 +99,13 @@ static constexpr u16 s_Indices[]
 {
 	0, 1, 2,
 	2, 3, 0,
+};
+
+struct uniform_buffer_object
+{
+	glm::mat4 Model;
+	glm::mat4 View;
+	glm::mat4 Proj;
 };
 
 static u32 FindMemoryType(u32 TypeFilter, VkMemoryPropertyFlags Properties, VkPhysicalDevice PhysicalDevice)
@@ -868,13 +878,39 @@ static VkRenderPass CreateRenderPass(VkDevice Device, swap_chain* Swapchain)
 	return Result;
 }
 
+static VkDescriptorSetLayout CreateDescriptorSetLayout(VkDevice Device)
+{
+	VkDescriptorSetLayoutBinding UboLayoutBinding
+	{
+		.binding = 0,
+		.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+		.descriptorCount = 1,
+		.stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
+	};
+
+	VkDescriptorSetLayoutCreateInfo LayoutInfo
+	{
+		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+		.bindingCount = 1,
+		.pBindings = &UboLayoutBinding,
+	};
+
+	VkDescriptorSetLayout Result = VK_NULL_HANDLE;
+	if (vkCreateDescriptorSetLayout(Device, &LayoutInfo, nullptr, &Result) != VK_SUCCESS) // pAllocator
+	{
+		fprintf(stderr, "Failed to create desc set layout\n");
+		Assert(false);
+	}
+	return Result;
+}
+
 struct vulkan_pipeline
 {
 	VkPipeline Handle;
 	VkPipelineLayout Layout;
 };
 
-static vulkan_pipeline CreateGraphicsPipeline(VkDevice Device, swap_chain* Swapchain, VkRenderPass RenderPass)
+static vulkan_pipeline CreateGraphicsPipeline(VkDevice Device, swap_chain* Swapchain, VkRenderPass RenderPass, VkDescriptorSetLayout DescSetLayout)
 {
 	file_buffer VertShaderCode = LoadFile("shaders/vert.spv");
 	file_buffer FragShaderCode = LoadFile("shaders/frag.spv");
@@ -989,7 +1025,9 @@ static vulkan_pipeline CreateGraphicsPipeline(VkDevice Device, swap_chain* Swapc
 
 	VkPipelineLayoutCreateInfo LayoutCreateInfo
 	{
-		.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO
+		.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+		.setLayoutCount = 1,
+		.pSetLayouts = &DescSetLayout,
 	};
 
 	vulkan_pipeline Result = {};
@@ -1215,6 +1253,23 @@ static vulkan_buffer CreateIndexBuffer(VkDevice Device, VkPhysicalDevice Physica
 	return Result;
 }
 
+static vulkan_buffer* CreateUniformBuffers(VkDevice Device, VkPhysicalDevice PhysicalDevice, void*** UniformBufferPtrs)
+{
+	VkDeviceSize BufferSize = sizeof(uniform_buffer_object);
+	vulkan_buffer* Result = AllocArray(vulkan_buffer, MAX_FRAMES_IN_FLIGHT);
+	*UniformBufferPtrs = AllocArray(void*, MAX_FRAMES_IN_FLIGHT);
+	for (u32 i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
+	{
+		vulkan_buffer* Buffer = Result + i;
+		void** UserPtr = (*UniformBufferPtrs) + i;
+		*Buffer = CreateBuffer(Device, PhysicalDevice, BufferSize, 
+							   VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, 
+							   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+		vkMapMemory(Device, Buffer->Memory, 0, BufferSize, 0, UserPtr);
+	}
+	return Result;
+}
+
 struct vulkan_stuff
 {
 	VkInstance Instance;
@@ -1225,6 +1280,7 @@ struct vulkan_stuff
 	VkCommandPool CommandPool;
 	VkCommandBuffer* CommandBuffers; // MAX_FRAMES_IN_FLIGHT of these
 	swap_chain Swapchain;
+	VkDescriptorSetLayout DescSetLayout;
 	vulkan_pipeline Pipeline;
 	physical_device_deets PhysicalDevice;
 
@@ -1234,6 +1290,8 @@ struct vulkan_stuff
 
 	vulkan_buffer VertexBuffer;
 	vulkan_buffer IndexBuffer;
+	vulkan_buffer* UniformBuffers;
+	void** UniformBufferPtrs;
 
 	u32 CurrentFrame;
 	b32 PendingFramebufferResize;
@@ -1342,15 +1400,40 @@ static vulkan_stuff InitVulkan(GLFWwindow* Window)
 	vkGetDeviceQueue(Result.Device, Result.PhysicalDevice.QueueFamilyIndices.GraphicsFamily, 0, &Result.GraphicsQueue);
 	Result.Swapchain = CreateSwapChain(&Result.PhysicalDevice, Result.Device, Window, Result.Surface);
 	Result.RenderPass = CreateRenderPass(Result.Device, &Result.Swapchain);
-	Result.Pipeline = CreateGraphicsPipeline(Result.Device, &Result.Swapchain, Result.RenderPass);
+	Result.DescSetLayout = CreateDescriptorSetLayout(Result.Device);
+	Result.Pipeline = CreateGraphicsPipeline(Result.Device, &Result.Swapchain, Result.RenderPass, Result.DescSetLayout);
 	CreateFramebuffers(&Result.Swapchain, Result.Device, Result.RenderPass);
 	Result.CommandPool = CreateCommandPool(Result.Device, Result.PhysicalDevice.QueueFamilyIndices.GraphicsFamily);
 	Result.VertexBuffer = CreateVertexBuffer(Result.Device, Result.PhysicalDevice.Handle, Result.CommandPool, Result.GraphicsQueue);
 	Result.IndexBuffer = CreateIndexBuffer(Result.Device, Result.PhysicalDevice.Handle, Result.CommandPool, Result.GraphicsQueue);
+	Result.UniformBuffers = CreateUniformBuffers(Result.Device, Result.PhysicalDevice.Handle, &Result.UniformBufferPtrs);
 	Result.CommandBuffers = CreateCommandBuffers(Result.Device, Result.CommandPool);
 	CreateSyncObjects(&Result);
 
 	return Result;
+}
+
+static void UpdateUniformBuffer(vulkan_stuff* VulkanStuff)
+{
+	static std::chrono::time_point StartTime = std::chrono::high_resolution_clock::now();
+
+	std::chrono::time_point CurrentTime = std::chrono::high_resolution_clock::now();
+	float TimePassed = std::chrono::duration<float, std::chrono::seconds::period>(CurrentTime - StartTime).count();
+
+	float Aspect = (float)VulkanStuff->Swapchain.Extents.width / (float)VulkanStuff->Swapchain.Extents.height;
+	uniform_buffer_object Ubo
+	{
+		// Rotate around z-axis
+		.Model = glm::rotate(glm::mat4(1.0f), TimePassed * glm::radians(90.0f), glm::vec3(0.0f, 0.0f, 1.0f)),
+		// Z is up??
+		.View = glm::lookAt(glm::vec3(2.0f, 2.0f, 2.0f), glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(0.0f, 0.0f, 1.0f)),
+		.Proj = glm::perspective(glm::radians(45.0f), Aspect, 0.1f, 10.0f),
+	};
+	// Apparently we need to flip the Y-coordinate of the clip space coords, because it's inverted from OpenGL
+	Ubo.Proj[1][1] *= -1.0f;
+
+	void* CpuBuffer = VulkanStuff->UniformBufferPtrs[VulkanStuff->CurrentFrame];
+	memcpy(CpuBuffer, &Ubo, sizeof(Ubo));
 }
 
 static void RecordCommandBuffer(vulkan_stuff* VulkanStuff, u32 ImageIndex)
@@ -1439,6 +1522,8 @@ static void DrawFrame(vulkan_stuff* VulkanStuff, GLFWwindow* Window)
 		vkResetCommandBuffer(VulkanStuff->CommandBuffers[VulkanStuff->CurrentFrame], 0);
 		RecordCommandBuffer(VulkanStuff, ImageIndex);
 
+		UpdateUniformBuffer(VulkanStuff);
+
 		VkPipelineStageFlags WaitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
 		VkSubmitInfo SubmitInfo
 		{
@@ -1503,6 +1588,12 @@ static void CleanUp(GLFWwindow* Window, vulkan_stuff* VulkanStuff)
 	DestroyDebugCallback(VulkanStuff->Instance);
 #endif
 	CleanUpSwapchain(VulkanStuff->Device, &VulkanStuff->Swapchain);
+	for (u32 i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
+	{
+		vkDestroyBuffer(VulkanStuff->Device, VulkanStuff->UniformBuffers[i].Handle, nullptr); // pAllocator
+		vkFreeMemory(VulkanStuff->Device, VulkanStuff->UniformBuffers[i].Memory, nullptr); // pAllocator
+	}
+	vkDestroyDescriptorSetLayout(VulkanStuff->Device, VulkanStuff->DescSetLayout, nullptr); // pAllocator
 	vkDestroyBuffer(VulkanStuff->Device, VulkanStuff->IndexBuffer.Handle, nullptr); // pAllocator
 	vkFreeMemory(VulkanStuff->Device, VulkanStuff->IndexBuffer.Memory, nullptr); // pAllocator
 	vkDestroyBuffer(VulkanStuff->Device, VulkanStuff->VertexBuffer.Handle, nullptr); // pAllocator
