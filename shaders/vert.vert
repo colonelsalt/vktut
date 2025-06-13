@@ -1,6 +1,6 @@
 #version 450
 
-layout(binding = 0) uniform uniform_buffer_object
+layout(set = 0, binding = 0) uniform uniform_buffer_object
 {
     mat4 Model;
     mat4 View;

@@ -10,6 +10,7 @@
 #include <cstring>
 
 #define GLM_FORCE_RADIANS
+#define GLM_FORCE_DEFAULT_ALIGNED_GENTYPES
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <chrono>
@@ -103,9 +104,9 @@ static constexpr u16 s_Indices[]
 
 struct uniform_buffer_object
 {
-	glm::mat4 Model;
-	glm::mat4 View;
-	glm::mat4 Proj;
+	alignas(16) glm::mat4 Model;
+	alignas(16) glm::mat4 View;
+	alignas(16) glm::mat4 Proj;
 };
 
 static u32 FindMemoryType(u32 TypeFilter, VkMemoryPropertyFlags Properties, VkPhysicalDevice PhysicalDevice)
@@ -217,6 +218,7 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL DebugCallback(VkDebugUtilsMessageSeverityF
 	if (SeverityBits >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT)
 	{
 		fprintf(stderr, "Validation layer: %s\n", CallbackData->pMessage);
+		u32 YourMum = 69;
 	}
 	return VK_FALSE;
 }
@@ -990,7 +992,7 @@ static vulkan_pipeline CreateGraphicsPipeline(VkDevice Device, swap_chain* Swapc
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
 		.polygonMode = VK_POLYGON_MODE_FILL,
 		.cullMode = VK_CULL_MODE_BACK_BIT,
-		.frontFace = VK_FRONT_FACE_CLOCKWISE,
+		.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE, // Temp change because of y-coord flip in proj. matrix??
 		.lineWidth = 1.0f, // TODO: I'm not drawing any lines, do I need this??
 	};
 
@@ -1270,6 +1272,82 @@ static vulkan_buffer* CreateUniformBuffers(VkDevice Device, VkPhysicalDevice Phy
 	return Result;
 }
 
+static VkDescriptorPool CreateDescriptorPool(VkDevice Device)
+{
+	VkDescriptorPoolSize PoolSize
+	{
+		.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+		.descriptorCount = MAX_FRAMES_IN_FLIGHT,
+	};
+
+	VkDescriptorPoolCreateInfo PoolInfo
+	{
+		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+		.maxSets = MAX_FRAMES_IN_FLIGHT,
+		.poolSizeCount = 1,
+		.pPoolSizes = &PoolSize,
+	};
+
+	VkDescriptorPool Result = VK_NULL_HANDLE;
+	if (vkCreateDescriptorPool(Device, &PoolInfo, nullptr, &Result) != VK_SUCCESS)
+	{
+		fprintf(stderr, "Failed to create descriptor pool bro\n");
+		Assert(false);
+	}
+	return Result;
+}
+
+static VkDescriptorSet* CreateDescriptorSets(VkDevice Device, VkDescriptorSetLayout DescSetLayout, VkDescriptorPool DescPool, vulkan_buffer* UniformBuffers)
+{
+	VkDescriptorSetLayout Layouts[MAX_FRAMES_IN_FLIGHT];
+	for (u32 i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
+	{
+		Layouts[i] = DescSetLayout;
+	}
+
+	VkDescriptorSetAllocateInfo AllocInfo
+	{
+		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+		.descriptorPool = DescPool,
+		.descriptorSetCount = MAX_FRAMES_IN_FLIGHT,
+		.pSetLayouts = Layouts,
+	};
+
+	VkDescriptorSet* Result = AllocArray(VkDescriptorSet, MAX_FRAMES_IN_FLIGHT);
+	if (vkAllocateDescriptorSets(Device, &AllocInfo, Result) == VK_SUCCESS)
+	{
+		for (u32 i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
+		{
+			VkDescriptorBufferInfo BufferInfo
+			{
+				.buffer = UniformBuffers[i].Handle,
+				.offset = 0,
+				.range = sizeof(uniform_buffer_object),
+			};
+
+			VkWriteDescriptorSet DescWrite
+			{
+				.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+				.dstSet = Result[i],
+				.dstBinding = 0,
+				.dstArrayElement = 0,
+				.descriptorCount = 1,
+				.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+				.pBufferInfo = &BufferInfo,
+			};
+
+			vkUpdateDescriptorSets(Device, 1, &DescWrite, 0, nullptr);
+		}
+	}
+	else
+	{
+		Result = nullptr;
+		fprintf(stderr, "Failed to allocate descriptor sets\n");
+		Assert(false);
+	}
+	return Result;
+}
+
 struct vulkan_stuff
 {
 	VkInstance Instance;
@@ -1292,6 +1370,9 @@ struct vulkan_stuff
 	vulkan_buffer IndexBuffer;
 	vulkan_buffer* UniformBuffers;
 	void** UniformBufferPtrs;
+
+	VkDescriptorPool DescPool;
+	VkDescriptorSet* DescSets;
 
 	u32 CurrentFrame;
 	b32 PendingFramebufferResize;
@@ -1407,6 +1488,8 @@ static vulkan_stuff InitVulkan(GLFWwindow* Window)
 	Result.VertexBuffer = CreateVertexBuffer(Result.Device, Result.PhysicalDevice.Handle, Result.CommandPool, Result.GraphicsQueue);
 	Result.IndexBuffer = CreateIndexBuffer(Result.Device, Result.PhysicalDevice.Handle, Result.CommandPool, Result.GraphicsQueue);
 	Result.UniformBuffers = CreateUniformBuffers(Result.Device, Result.PhysicalDevice.Handle, &Result.UniformBufferPtrs);
+	Result.DescPool = CreateDescriptorPool(Result.Device);
+	Result.DescSets = CreateDescriptorSets(Result.Device, Result.DescSetLayout, Result.DescPool, Result.UniformBuffers);
 	Result.CommandBuffers = CreateCommandBuffers(Result.Device, Result.CommandPool);
 	CreateSyncObjects(&Result);
 
@@ -1476,6 +1559,13 @@ static void RecordCommandBuffer(vulkan_stuff* VulkanStuff, u32 ImageIndex)
 
 		VkRect2D Scissor { .extent = VulkanStuff->Swapchain.Extents };
 		vkCmdSetScissor(CommandBuffer, 0, 1, &Scissor);
+
+		vkCmdBindDescriptorSets(CommandBuffer, 
+								VK_PIPELINE_BIND_POINT_GRAPHICS, 
+								VulkanStuff->Pipeline.Layout, 
+								0, 1, 
+								VulkanStuff->DescSets + VulkanStuff->CurrentFrame,
+								0, nullptr);
 
 		vkCmdDrawIndexed(CommandBuffer, ArrayCount(s_Indices), 1, 0, 0, 0);
 
@@ -1593,6 +1683,7 @@ static void CleanUp(GLFWwindow* Window, vulkan_stuff* VulkanStuff)
 		vkDestroyBuffer(VulkanStuff->Device, VulkanStuff->UniformBuffers[i].Handle, nullptr); // pAllocator
 		vkFreeMemory(VulkanStuff->Device, VulkanStuff->UniformBuffers[i].Memory, nullptr); // pAllocator
 	}
+	vkDestroyDescriptorPool(VulkanStuff->Device, VulkanStuff->DescPool, nullptr); // pAllocator
 	vkDestroyDescriptorSetLayout(VulkanStuff->Device, VulkanStuff->DescSetLayout, nullptr); // pAllocator
 	vkDestroyBuffer(VulkanStuff->Device, VulkanStuff->IndexBuffer.Handle, nullptr); // pAllocator
 	vkFreeMemory(VulkanStuff->Device, VulkanStuff->IndexBuffer.Memory, nullptr); // pAllocator
