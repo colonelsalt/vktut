@@ -15,6 +15,9 @@
 #include <glm/gtc/matrix_transform.hpp>
 #include <chrono>
 
+#define STB_IMAGE_IMPLEMENTATION
+#include <stb_image.h>
+
 typedef int8_t s8;
 typedef uint8_t u8;
 typedef uint16_t u16;
@@ -1162,7 +1165,7 @@ static vulkan_buffer CreateBuffer(VkDevice Device,
 	return Result;
 }
 
-static void CopyBuffer(VkBuffer SrcBuffer, VkBuffer DestBuffer, VkDeviceSize Size, VkDevice Device, VkCommandPool CommandPool, VkQueue GraphicsQueue)
+static VkCommandBuffer BeginOneOffCommand(VkCommandPool CommandPool, VkDevice Device)
 {
 	VkCommandBufferAllocateInfo AllocInfo
 	{
@@ -1172,7 +1175,7 @@ static void CopyBuffer(VkBuffer SrcBuffer, VkBuffer DestBuffer, VkDeviceSize Siz
 		.commandBufferCount = 1,
 	};
 
-	VkCommandBuffer CommandBuffer;
+	VkCommandBuffer CommandBuffer = VK_NULL_HANDLE;
 	vkAllocateCommandBuffers(Device, &AllocInfo, &CommandBuffer);
 
 	VkCommandBufferBeginInfo BeginInfo
@@ -1181,12 +1184,11 @@ static void CopyBuffer(VkBuffer SrcBuffer, VkBuffer DestBuffer, VkDeviceSize Siz
 		.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
 	};
 	vkBeginCommandBuffer(CommandBuffer, &BeginInfo);
+	return CommandBuffer;
+}
 
-	VkBufferCopy CopyRegion
-	{
-		.size = Size
-	};
-	vkCmdCopyBuffer(CommandBuffer, SrcBuffer, DestBuffer, 1, &CopyRegion);
+static void EndOneOffCommand(VkCommandBuffer CommandBuffer, VkQueue GraphicsQueue, VkCommandPool CommandPool, VkDevice Device)
+{
 	vkEndCommandBuffer(CommandBuffer);
 
 	VkSubmitInfo SubmitInfo
@@ -1199,6 +1201,19 @@ static void CopyBuffer(VkBuffer SrcBuffer, VkBuffer DestBuffer, VkDeviceSize Siz
 	vkQueueWaitIdle(GraphicsQueue);
 
 	vkFreeCommandBuffers(Device, CommandPool, 1, &CommandBuffer);
+}
+
+static void CopyBuffer(VkBuffer SrcBuffer, VkBuffer DestBuffer, VkDeviceSize Size, VkDevice Device, VkCommandPool CommandPool, VkQueue GraphicsQueue)
+{
+	VkCommandBuffer CommandBuffer = BeginOneOffCommand(CommandPool, Device);
+
+	VkBufferCopy CopyRegion
+	{
+		.size = Size
+	};
+	vkCmdCopyBuffer(CommandBuffer, SrcBuffer, DestBuffer, 1, &CopyRegion);
+	
+	EndOneOffCommand(CommandBuffer, GraphicsQueue, CommandPool, Device);
 }
 
 static vulkan_buffer CreateVertexBuffer(VkDevice Device, VkPhysicalDevice PhysicalDevice, VkCommandPool CommandPool, VkQueue GraphicsQueue)
@@ -1348,6 +1363,203 @@ static VkDescriptorSet* CreateDescriptorSets(VkDevice Device, VkDescriptorSetLay
 	return Result;
 }
 
+static void TransitionImageLayout(VkImage Image, VkFormat Format, VkImageLayout OldLayout, VkImageLayout NewLayout, 
+								  VkCommandPool CommandPool, VkQueue GraphicsQueue, VkDevice Device)
+{
+	VkCommandBuffer CommandBuffer = BeginOneOffCommand(CommandPool, Device);
+
+	VkImageMemoryBarrier Barrier
+	{
+		.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		.oldLayout = OldLayout,
+		.newLayout = NewLayout,
+		.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		.image = Image,
+		.subresourceRange
+		{
+			.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+			.baseMipLevel = 0,
+			.levelCount = 1,
+			.baseArrayLayer = 0,
+			.layerCount = 1,
+		},
+	};
+
+	VkPipelineStageFlags SourceStage = 0;
+	VkPipelineStageFlags DestStage = 0;
+	if (OldLayout == VK_IMAGE_LAYOUT_UNDEFINED && NewLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
+	{
+		Barrier.srcAccessMask = 0;
+		Barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+
+		SourceStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+		DestStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+	}
+	else if (OldLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL && NewLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+	{
+		Barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+		Barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+		SourceStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+		DestStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+	}
+	else
+	{
+		fprintf(stderr, "We've got an unsupported layout transition here my dudes\n");
+		Assert(false);
+	}
+
+	vkCmdPipelineBarrier(CommandBuffer,
+						 SourceStage, DestStage,
+						 0,
+						 0, nullptr,
+						 0, nullptr,
+						 1, &Barrier);
+
+	EndOneOffCommand(CommandBuffer, GraphicsQueue, CommandPool, Device);
+}
+
+static void CopyBufferToImage(VkBuffer Buffer, VkImage Image, u32 Width, u32 Height, 
+							  VkCommandPool CommandPool, VkQueue GraphicsQueue, VkDevice Device)
+{
+	VkCommandBuffer CommandBuffer = BeginOneOffCommand(CommandPool, Device);
+
+	VkBufferImageCopy Region
+	{
+		.bufferOffset = 0,
+		.bufferRowLength = 0,
+		.bufferImageHeight = 0,
+		.imageSubresource
+		{
+			.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+			.mipLevel = 0,
+			.baseArrayLayer = 0,
+			.layerCount = 1,
+		},
+		.imageExtent
+		{
+			.width = Width,
+			.height = Height,
+			.depth = 1,
+		},
+	};
+	vkCmdCopyBufferToImage(CommandBuffer, Buffer, Image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &Region);
+
+	EndOneOffCommand(CommandBuffer, GraphicsQueue, CommandPool, Device);
+}
+
+struct image_spec
+{
+	u32 Width;
+	u32 Height;
+	VkFormat Format;
+	VkImageTiling Tiling;
+	VkImageUsageFlags UsageFlags;
+	VkMemoryPropertyFlags MemPropFlags;
+};
+
+struct image
+{
+	VkImage Image;
+	VkDeviceMemory Memory;
+};
+
+static image CreateImage(VkDevice Device, VkPhysicalDevice PhysicalDevice, image_spec Spec)
+{
+	image Result = {};
+	VkImageCreateInfo ImageInfo
+	{
+		.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+		.imageType = VK_IMAGE_TYPE_2D,
+		.format = Spec.Format,
+		.extent = { .width = Spec.Width, .height = Spec.Height, .depth = 1 },
+		.mipLevels = 1,
+		.arrayLayers = 1,
+		.samples = VK_SAMPLE_COUNT_1_BIT,
+		.tiling = Spec.Tiling,
+		.usage = Spec.UsageFlags,
+		.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+		.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED, // TODO: Wtf does this actually mean
+	};
+	if (vkCreateImage(Device, &ImageInfo, nullptr, &Result.Image) == VK_SUCCESS) // pAllocator
+	{
+		VkMemoryRequirements MemReqs;
+		vkGetImageMemoryRequirements(Device, Result.Image, &MemReqs);
+
+		VkMemoryAllocateInfo AllocInfo
+		{
+			.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+			.allocationSize = MemReqs.size,
+			.memoryTypeIndex = FindMemoryType(MemReqs.memoryTypeBits, Spec.MemPropFlags, PhysicalDevice),
+		};
+		if (vkAllocateMemory(Device, &AllocInfo, nullptr, &Result.Memory) == VK_SUCCESS) // pAllocator
+		{
+			vkBindImageMemory(Device, Result.Image, Result.Memory, 0);
+		}
+		else
+		{
+			fprintf(stderr, "Sorry couldn't allocate image/texture memory mate\n");
+			Assert(false);
+		}
+	}
+	else
+	{
+		fprintf(stderr, "Failed to create image\n");
+		Assert(false);
+	}
+	return Result;
+}
+
+static image CreateTexture(VkDevice Device, VkPhysicalDevice PhysicalDevice, VkCommandPool CommandPool, VkQueue GraphicsQueue)
+{
+	image Result = {};
+
+	int TexWidth, TexHeight, NumChannels;
+	stbi_uc* Pixels = stbi_load("textures/texture.jpg", &TexWidth, &TexHeight, &NumChannels, STBI_rgb_alpha);
+	if (Pixels)
+	{
+		VkDeviceSize ImageSize = TexWidth * TexHeight * 4;
+		
+		vulkan_buffer StagingBuffer = CreateBuffer(Device, PhysicalDevice, ImageSize, 
+												   VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+												   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+		void* Data;
+		vkMapMemory(Device, StagingBuffer.Memory, 0, ImageSize, 0, &Data);
+		memcpy(Data, Pixels, ImageSize);
+		vkUnmapMemory(Device, StagingBuffer.Memory);
+		stbi_image_free(Pixels);
+
+		image_spec Spec
+		{
+			.Width = (u32)TexWidth,
+			.Height = (u32)TexHeight,
+			.Format = VK_FORMAT_R8G8B8A8_SRGB,
+			.Tiling = VK_IMAGE_TILING_OPTIMAL,
+			.UsageFlags = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+			.MemPropFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+		};
+		Result = CreateImage(Device, PhysicalDevice, Spec);
+
+		TransitionImageLayout(Result.Image, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+							  CommandPool, GraphicsQueue, Device);
+		CopyBufferToImage(StagingBuffer.Handle, Result.Image, TexWidth, TexHeight, CommandPool, GraphicsQueue, Device);
+		TransitionImageLayout(Result.Image, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+							  CommandPool, GraphicsQueue, Device);
+
+		vkDestroyBuffer(Device, StagingBuffer.Handle, nullptr); // pAllocator
+		vkFreeMemory(Device, StagingBuffer.Memory, nullptr); // pAllocator
+	}
+	else
+	{
+		fprintf(stderr, "Couldn't load that texture image, bro\n");
+		Assert(false);
+	}
+	return Result;
+}
+
+
 struct vulkan_stuff
 {
 	VkInstance Instance;
@@ -1370,6 +1582,8 @@ struct vulkan_stuff
 	vulkan_buffer IndexBuffer;
 	vulkan_buffer* UniformBuffers;
 	void** UniformBufferPtrs;
+
+	image Texture;
 
 	VkDescriptorPool DescPool;
 	VkDescriptorSet* DescSets;
@@ -1485,6 +1699,7 @@ static vulkan_stuff InitVulkan(GLFWwindow* Window)
 	Result.Pipeline = CreateGraphicsPipeline(Result.Device, &Result.Swapchain, Result.RenderPass, Result.DescSetLayout);
 	CreateFramebuffers(&Result.Swapchain, Result.Device, Result.RenderPass);
 	Result.CommandPool = CreateCommandPool(Result.Device, Result.PhysicalDevice.QueueFamilyIndices.GraphicsFamily);
+	Result.Texture = CreateTexture(Result.Device, Result.PhysicalDevice.Handle, Result.CommandPool, Result.GraphicsQueue);
 	Result.VertexBuffer = CreateVertexBuffer(Result.Device, Result.PhysicalDevice.Handle, Result.CommandPool, Result.GraphicsQueue);
 	Result.IndexBuffer = CreateIndexBuffer(Result.Device, Result.PhysicalDevice.Handle, Result.CommandPool, Result.GraphicsQueue);
 	Result.UniformBuffers = CreateUniformBuffers(Result.Device, Result.PhysicalDevice.Handle, &Result.UniformBufferPtrs);
@@ -1678,6 +1893,10 @@ static void CleanUp(GLFWwindow* Window, vulkan_stuff* VulkanStuff)
 	DestroyDebugCallback(VulkanStuff->Instance);
 #endif
 	CleanUpSwapchain(VulkanStuff->Device, &VulkanStuff->Swapchain);
+
+	vkDestroyImage(VulkanStuff->Device, VulkanStuff->Texture.Image, nullptr); // pAllocator
+	vkFreeMemory(VulkanStuff->Device, VulkanStuff->Texture.Memory, nullptr); // pAllocator
+
 	for (u32 i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
 	{
 		vkDestroyBuffer(VulkanStuff->Device, VulkanStuff->UniformBuffers[i].Handle, nullptr); // pAllocator
