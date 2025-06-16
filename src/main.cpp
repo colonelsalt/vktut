@@ -442,16 +442,18 @@ static u32 RateDeviceSuitability(VkPhysicalDevice Device, queue_family_indices Q
 {
 	u32 Score = 0;
 
+	VkPhysicalDeviceFeatures DeviceFeatures;
+	vkGetPhysicalDeviceFeatures(Device, &DeviceFeatures);
+
 	if ((QueueFamilyBois.ValidFlags & QueueFamily_Graphics) && 
 		(QueueFamilyBois.ValidFlags & QueueFamily_Present) &&
 		CheckDeviceSupportsExtensions(Device) &&
 		SwapChainDeets->NumFormats > 0 &&
-		SwapChainDeets->NumPresentModes > 0)
+		SwapChainDeets->NumPresentModes > 0 &&
+		DeviceFeatures.samplerAnisotropy)
 	{
 		VkPhysicalDeviceProperties DeviceProps;
 		vkGetPhysicalDeviceProperties(Device, &DeviceProps);
-		VkPhysicalDeviceFeatures DeviceFeatures;
-		vkGetPhysicalDeviceFeatures(Device, &DeviceFeatures);
 		if (DeviceProps.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)
 		{
 			Score += 1'000;
@@ -654,7 +656,10 @@ static VkDevice CreateLogicalDevice(physical_device_deets DeviceDeets)
 	// TODO: Oink oink
 	Assert(DeviceDeets.QueueFamilyIndices.GraphicsFamily == DeviceDeets.QueueFamilyIndices.PresentFamily);
 
-	VkPhysicalDeviceFeatures DeviceFeatures = {}; // Apparently we're going to modify this later...
+	VkPhysicalDeviceFeatures DeviceFeatures 
+	{
+		.samplerAnisotropy = VK_TRUE, // TODO: Probably actually don't want this for pixel art stuff later
+	};
 
 	f32 QueuePriority = 1.0f;
 	VkDeviceQueueCreateInfo QueueCreateInfo
@@ -742,6 +747,40 @@ static void CreateFramebuffers(swap_chain* Swapchain, VkDevice Device, VkRenderP
 	}
 }
 
+static VkImageView CreateImageView(VkDevice Device, VkImage Image, VkFormat Format)
+{
+	VkImageViewCreateInfo IvCreateInfo
+	{
+		.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+		.image = Image,
+		.viewType = VK_IMAGE_VIEW_TYPE_2D,
+		.format = Format,
+		.components
+		{
+			.r = VK_COMPONENT_SWIZZLE_IDENTITY,
+			.g = VK_COMPONENT_SWIZZLE_IDENTITY,
+			.b = VK_COMPONENT_SWIZZLE_IDENTITY,
+			.a = VK_COMPONENT_SWIZZLE_IDENTITY,
+		},
+		.subresourceRange
+		{
+			.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+			.baseMipLevel = 0,
+			.levelCount = 1,
+			.baseArrayLayer = 0,
+			.layerCount = 1,
+		},
+	};
+
+	VkImageView Result = VK_NULL_HANDLE;
+	if (vkCreateImageView(Device, &IvCreateInfo, nullptr, &Result) != VK_SUCCESS) // pAllocator
+	{
+		Assert(false);
+		fprintf(stderr, "Failed to create image view...\n");
+	}
+	return Result;
+}
+
 static swap_chain CreateSwapChain(physical_device_deets* DeviceDeets,
 								  VkDevice LogicalDevice,
 								  GLFWwindow* Window,
@@ -790,33 +829,7 @@ static swap_chain CreateSwapChain(physical_device_deets* DeviceDeets,
 		Result.ImageViews = AllocArray(VkImageView, Result.NumImages);
 		for (u32 i = 0; i < Result.NumImages; i++)
 		{
-			VkImageViewCreateInfo IvCreateInfo
-			{
-				.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-				.image = Result.Images[i],
-				.viewType = VK_IMAGE_VIEW_TYPE_2D,
-				.format = Result.Format,
-				.components = 
-				{
-					.r = VK_COMPONENT_SWIZZLE_IDENTITY,
-					.g = VK_COMPONENT_SWIZZLE_IDENTITY,
-					.b = VK_COMPONENT_SWIZZLE_IDENTITY,
-					.a = VK_COMPONENT_SWIZZLE_IDENTITY,
-				},
-				.subresourceRange =
-				{
-					.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-					.baseMipLevel = 0,
-					.levelCount = 1,
-					.baseArrayLayer = 0,
-					.layerCount = 1
-				},
-			};
-			if (vkCreateImageView(LogicalDevice, &IvCreateInfo, nullptr, Result.ImageViews + i) != VK_SUCCESS) // pAllocator
-			{
-				Assert(false);
-				fprintf(stderr, "Failed to create image view number %u...\n", i);
-			}
+			Result.ImageViews[i] = CreateImageView(LogicalDevice, Result.Images[i], Result.Format);
 		}
 	}
 	else
@@ -1559,6 +1572,40 @@ static image CreateTexture(VkDevice Device, VkPhysicalDevice PhysicalDevice, VkC
 	return Result;
 }
 
+static VkSampler CreateTextureSampler(VkDevice Device, VkPhysicalDevice PhysicalDevice)
+{
+	VkPhysicalDeviceProperties Props = {};
+	vkGetPhysicalDeviceProperties(PhysicalDevice, &Props);
+
+	VkSamplerCreateInfo SamplerInfo
+	{
+		.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+		.magFilter = VK_FILTER_LINEAR,
+		.minFilter = VK_FILTER_LINEAR,
+		.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR,
+		.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+		.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+		.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+		.mipLodBias = 0.0f,
+		.anisotropyEnable = VK_TRUE,
+		.maxAnisotropy = Props.limits.maxSamplerAnisotropy,
+		.compareEnable = VK_FALSE,
+		.compareOp = VK_COMPARE_OP_ALWAYS,
+		.minLod = 0.0f,
+		.maxLod = 0.0f,
+		.borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK,
+		.unnormalizedCoordinates = VK_FALSE,
+	};
+
+	VkSampler Result = VK_NULL_HANDLE;
+	if (vkCreateSampler(Device, &SamplerInfo, nullptr, &Result) != VK_SUCCESS) // pAllocator
+	{
+		fprintf(stderr, "Failed to create that there sampler, my friend\n");
+		Assert(false);
+	}
+	return Result;
+}
+
 
 struct vulkan_stuff
 {
@@ -1584,6 +1631,8 @@ struct vulkan_stuff
 	void** UniformBufferPtrs;
 
 	image Texture;
+	VkImageView TextureImageView;
+	VkSampler TextureSampler;
 
 	VkDescriptorPool DescPool;
 	VkDescriptorSet* DescSets;
@@ -1700,6 +1749,8 @@ static vulkan_stuff InitVulkan(GLFWwindow* Window)
 	CreateFramebuffers(&Result.Swapchain, Result.Device, Result.RenderPass);
 	Result.CommandPool = CreateCommandPool(Result.Device, Result.PhysicalDevice.QueueFamilyIndices.GraphicsFamily);
 	Result.Texture = CreateTexture(Result.Device, Result.PhysicalDevice.Handle, Result.CommandPool, Result.GraphicsQueue);
+	Result.TextureImageView = CreateImageView(Result.Device, Result.Texture.Image, VK_FORMAT_R8G8B8A8_SRGB);
+	Result.TextureSampler = CreateTextureSampler(Result.Device, Result.PhysicalDevice.Handle);
 	Result.VertexBuffer = CreateVertexBuffer(Result.Device, Result.PhysicalDevice.Handle, Result.CommandPool, Result.GraphicsQueue);
 	Result.IndexBuffer = CreateIndexBuffer(Result.Device, Result.PhysicalDevice.Handle, Result.CommandPool, Result.GraphicsQueue);
 	Result.UniformBuffers = CreateUniformBuffers(Result.Device, Result.PhysicalDevice.Handle, &Result.UniformBufferPtrs);
@@ -1893,7 +1944,8 @@ static void CleanUp(GLFWwindow* Window, vulkan_stuff* VulkanStuff)
 	DestroyDebugCallback(VulkanStuff->Instance);
 #endif
 	CleanUpSwapchain(VulkanStuff->Device, &VulkanStuff->Swapchain);
-
+	vkDestroySampler(VulkanStuff->Device, VulkanStuff->TextureSampler, nullptr); // pAllocator
+	vkDestroyImageView(VulkanStuff->Device, VulkanStuff->TextureImageView, nullptr); // pAllocator
 	vkDestroyImage(VulkanStuff->Device, VulkanStuff->Texture.Image, nullptr); // pAllocator
 	vkFreeMemory(VulkanStuff->Device, VulkanStuff->Texture.Memory, nullptr); // pAllocator
 
