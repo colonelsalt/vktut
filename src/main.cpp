@@ -50,6 +50,7 @@ struct vertex
 {
 	glm::vec2 Position;
 	glm::vec3 Colour;
+	glm::vec2 TexCoord;
 
 	static VkVertexInputBindingDescription GetBindingDescription()
 	{
@@ -64,9 +65,10 @@ struct vertex
 
 	struct attr_desc
 	{
-		static constexpr u32 Size = 2;
+		static constexpr u32 Size = 3;
 		VkVertexInputAttributeDescription Data[Size];
 	};
+
 	static attr_desc GetAttributeDescriptions()
 	{
 		attr_desc Result
@@ -77,26 +79,33 @@ struct vertex
 					.location = 0,
 					.binding = 0,
 					.format = VK_FORMAT_R32G32B32_SFLOAT,
-					.offset = offsetof(vertex, Position)
+					.offset = offsetof(vertex, Position),
 				},
 				{
 					.location = 1,
 					.binding = 0,
 					.format = VK_FORMAT_R32G32B32_SFLOAT,
-					.offset = offsetof(vertex, Colour)
-				}
+					.offset = offsetof(vertex, Colour),
+				},
+				{
+					.location = 2,
+					.binding = 0,
+					.format = VK_FORMAT_R32G32_SFLOAT,
+					.offset = offsetof(vertex, TexCoord),
+				},
 			}
 		};
 		return Result;
 	}
 };
 
+
 static constexpr vertex s_Vertices[]
 {
-	{ .Position = { -0.5f, -0.5f }, .Colour = { 1.0f, 0.0f, 0.0f } },
-	{ .Position = {  0.5f, -0.5f }, .Colour = { 0.0f, 1.0f, 0.0f } },
-	{ .Position = {  0.5f,  0.5f }, .Colour = { 0.0f, 0.0f, 1.0f } },
-	{ .Position = { -0.5f,  0.5f }, .Colour = { 1.0f, 1.0f, 1.0f } },
+	{ .Position = { -0.5f, -0.5f }, .Colour = { 1.0f, 0.0f, 0.0f }, .TexCoord = { 1.0f, 0.0f } },
+	{ .Position = {  0.5f, -0.5f }, .Colour = { 0.0f, 1.0f, 0.0f }, .TexCoord = { 0.0f, 0.0f } },
+	{ .Position = {  0.5f,  0.5f }, .Colour = { 0.0f, 0.0f, 1.0f }, .TexCoord = { 0.0f, 1.0f } },
+	{ .Position = { -0.5f,  0.5f }, .Colour = { 1.0f, 1.0f, 1.0f }, .TexCoord = { 1.0f, 1.0f } },
 };
 
 static constexpr u16 s_Indices[]
@@ -905,12 +914,20 @@ static VkDescriptorSetLayout CreateDescriptorSetLayout(VkDevice Device)
 		.descriptorCount = 1,
 		.stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
 	};
+	VkDescriptorSetLayoutBinding SamplerLayoutBinding
+	{
+		.binding = 1,
+		.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+		.descriptorCount = 1,
+		.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+	};
+	VkDescriptorSetLayoutBinding Bindings[] = { UboLayoutBinding, SamplerLayoutBinding };
 
 	VkDescriptorSetLayoutCreateInfo LayoutInfo
 	{
 		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-		.bindingCount = 1,
-		.pBindings = &UboLayoutBinding,
+		.bindingCount = ArrayCount(Bindings),
+		.pBindings = Bindings,
 	};
 
 	VkDescriptorSetLayout Result = VK_NULL_HANDLE;
@@ -1302,18 +1319,24 @@ static vulkan_buffer* CreateUniformBuffers(VkDevice Device, VkPhysicalDevice Phy
 
 static VkDescriptorPool CreateDescriptorPool(VkDevice Device)
 {
-	VkDescriptorPoolSize PoolSize
+	VkDescriptorPoolSize PoolSizeUbo
 	{
 		.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
 		.descriptorCount = MAX_FRAMES_IN_FLIGHT,
 	};
+	VkDescriptorPoolSize PoolSizeSampler
+	{
+		.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+		.descriptorCount = MAX_FRAMES_IN_FLIGHT,
+	};
+	VkDescriptorPoolSize PoolSizes[] = { PoolSizeUbo, PoolSizeSampler };
 
 	VkDescriptorPoolCreateInfo PoolInfo
 	{
 		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
 		.maxSets = MAX_FRAMES_IN_FLIGHT,
-		.poolSizeCount = 1,
-		.pPoolSizes = &PoolSize,
+		.poolSizeCount = ArrayCount(PoolSizes),
+		.pPoolSizes = PoolSizes,
 	};
 
 	VkDescriptorPool Result = VK_NULL_HANDLE;
@@ -1325,7 +1348,12 @@ static VkDescriptorPool CreateDescriptorPool(VkDevice Device)
 	return Result;
 }
 
-static VkDescriptorSet* CreateDescriptorSets(VkDevice Device, VkDescriptorSetLayout DescSetLayout, VkDescriptorPool DescPool, vulkan_buffer* UniformBuffers)
+static VkDescriptorSet* CreateDescriptorSets(VkDevice Device, 
+											 VkDescriptorSetLayout DescSetLayout, 
+											 VkDescriptorPool DescPool, 
+											 vulkan_buffer* UniformBuffers,
+											 VkImageView TextureImageView,
+											 VkSampler TextureSampler)
 {
 	VkDescriptorSetLayout Layouts[MAX_FRAMES_IN_FLIGHT];
 	for (u32 i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
@@ -1352,8 +1380,14 @@ static VkDescriptorSet* CreateDescriptorSets(VkDevice Device, VkDescriptorSetLay
 				.offset = 0,
 				.range = sizeof(uniform_buffer_object),
 			};
+			VkDescriptorImageInfo ImageInfo
+			{
+				.sampler = TextureSampler,
+				.imageView = TextureImageView,
+				.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+			};
 
-			VkWriteDescriptorSet DescWrite
+			VkWriteDescriptorSet DescWriteUbo
 			{
 				.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
 				.dstSet = Result[i],
@@ -1363,8 +1397,19 @@ static VkDescriptorSet* CreateDescriptorSets(VkDevice Device, VkDescriptorSetLay
 				.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
 				.pBufferInfo = &BufferInfo,
 			};
+			VkWriteDescriptorSet DescWriteSampler
+			{
+				.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+				.dstSet = Result[i],
+				.dstBinding = 1,
+				.dstArrayElement = 0,
+				.descriptorCount = 1,
+				.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+				.pImageInfo = &ImageInfo,
+			};
 
-			vkUpdateDescriptorSets(Device, 1, &DescWrite, 0, nullptr);
+			VkWriteDescriptorSet DescWrites[] = { DescWriteUbo, DescWriteSampler };
+			vkUpdateDescriptorSets(Device, ArrayCount(DescWrites), DescWrites, 0, nullptr);
 		}
 	}
 	else
@@ -1755,7 +1800,8 @@ static vulkan_stuff InitVulkan(GLFWwindow* Window)
 	Result.IndexBuffer = CreateIndexBuffer(Result.Device, Result.PhysicalDevice.Handle, Result.CommandPool, Result.GraphicsQueue);
 	Result.UniformBuffers = CreateUniformBuffers(Result.Device, Result.PhysicalDevice.Handle, &Result.UniformBufferPtrs);
 	Result.DescPool = CreateDescriptorPool(Result.Device);
-	Result.DescSets = CreateDescriptorSets(Result.Device, Result.DescSetLayout, Result.DescPool, Result.UniformBuffers);
+	Result.DescSets = CreateDescriptorSets(Result.Device, Result.DescSetLayout, Result.DescPool, Result.UniformBuffers, 
+										   Result.TextureImageView, Result.TextureSampler);
 	Result.CommandBuffers = CreateCommandBuffers(Result.Device, Result.CommandPool);
 	CreateSyncObjects(&Result);
 
