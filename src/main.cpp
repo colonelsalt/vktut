@@ -10,6 +10,7 @@
 #include <cstring>
 
 #define GLM_FORCE_RADIANS
+#define GLM_FORCE_DEPTH_ZERO_TO_ONE
 #define GLM_FORCE_DEFAULT_ALIGNED_GENTYPES
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
@@ -48,7 +49,7 @@ static u32 Clamp(u32 Value, u32 Min, u32 Max)
 
 struct vertex
 {
-	glm::vec2 Position;
+	glm::vec3 Position;
 	glm::vec3 Colour;
 	glm::vec2 TexCoord;
 
@@ -102,16 +103,24 @@ struct vertex
 
 static constexpr vertex s_Vertices[]
 {
-	{ .Position = { -0.5f, -0.5f }, .Colour = { 1.0f, 0.0f, 0.0f }, .TexCoord = { 1.0f, 0.0f } },
-	{ .Position = {  0.5f, -0.5f }, .Colour = { 0.0f, 1.0f, 0.0f }, .TexCoord = { 0.0f, 0.0f } },
-	{ .Position = {  0.5f,  0.5f }, .Colour = { 0.0f, 0.0f, 1.0f }, .TexCoord = { 0.0f, 1.0f } },
-	{ .Position = { -0.5f,  0.5f }, .Colour = { 1.0f, 1.0f, 1.0f }, .TexCoord = { 1.0f, 1.0f } },
+	{ .Position = { -0.5f, -0.5f,  0.0f }, .Colour = { 1.0f, 0.0f, 0.0f }, .TexCoord = { 1.0f, 0.0f } },
+	{ .Position = {  0.5f, -0.5f,  0.0f }, .Colour = { 0.0f, 1.0f, 0.0f }, .TexCoord = { 0.0f, 0.0f } },
+	{ .Position = {  0.5f,  0.5f,  0.0f }, .Colour = { 0.0f, 0.0f, 1.0f }, .TexCoord = { 0.0f, 1.0f } },
+	{ .Position = { -0.5f,  0.5f,  0.0f }, .Colour = { 1.0f, 1.0f, 1.0f }, .TexCoord = { 1.0f, 1.0f } },
+
+	{ .Position = { -0.5f, -0.5f, -0.5f }, .Colour = { 1.0f, 0.0f, 0.0f }, .TexCoord = { 1.0f, 0.0f } },
+	{ .Position = {  0.5f, -0.5f, -0.5f }, .Colour = { 0.0f, 1.0f, 0.0f }, .TexCoord = { 0.0f, 0.0f } },
+	{ .Position = {  0.5f,  0.5f, -0.5f }, .Colour = { 0.0f, 0.0f, 1.0f }, .TexCoord = { 0.0f, 1.0f } },
+	{ .Position = { -0.5f,  0.5f, -0.5f }, .Colour = { 1.0f, 1.0f, 1.0f }, .TexCoord = { 1.0f, 1.0f } },
 };
 
 static constexpr u16 s_Indices[]
 {
 	0, 1, 2,
 	2, 3, 0,
+
+	4, 5, 6,
+	6, 7, 4,
 };
 
 struct uniform_buffer_object
@@ -719,6 +728,13 @@ static VkSurfaceKHR CreateSurface(VkInstance Instance, GLFWwindow* Window)
 	return Result;
 }
 
+struct image
+{
+	VkImage Image;
+	VkImageView ImageView;
+	VkDeviceMemory Memory;
+};
+
 struct swap_chain
 {
 	VkSwapchainKHR Handle;
@@ -730,23 +746,23 @@ struct swap_chain
 	VkExtent2D Extents;
 };
 
-static void CreateFramebuffers(swap_chain* Swapchain, VkDevice Device, VkRenderPass RenderPass)
+static void CreateFramebuffers(swap_chain* Swapchain, image DepthImage, VkDevice Device, VkRenderPass RenderPass)
 {
 	// TODO: Is this the cleanest way of reusing memory from previous framebuffers?
 	Swapchain->Framebuffers = AllocArray(VkFramebuffer, Swapchain->NumImages);
 	for (u32 i = 0; i < Swapchain->NumImages; i++)
 	{
-		VkImageView* Attachment = Swapchain->ImageViews + i;
+		VkImageView Attachments[] = { Swapchain->ImageViews[i], DepthImage.ImageView };
 
 		VkFramebufferCreateInfo FramebufferInfo
 		{
 			.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
 			.renderPass = RenderPass,
-			.attachmentCount = 1,
-			.pAttachments = Attachment,
+			.attachmentCount = ArrayCount(Attachments),
+			.pAttachments = Attachments,
 			.width = Swapchain->Extents.width,
 			.height = Swapchain->Extents.height,
-			.layers = 1
+			.layers = 1,
 		};
 		if (vkCreateFramebuffer(Device, &FramebufferInfo, nullptr, Swapchain->Framebuffers + i) != VK_SUCCESS) // pAllocator
 		{
@@ -756,7 +772,7 @@ static void CreateFramebuffers(swap_chain* Swapchain, VkDevice Device, VkRenderP
 	}
 }
 
-static VkImageView CreateImageView(VkDevice Device, VkImage Image, VkFormat Format)
+static VkImageView CreateImageView(VkDevice Device, VkImage Image, VkFormat Format, VkImageAspectFlags AspectFlags)
 {
 	VkImageViewCreateInfo IvCreateInfo
 	{
@@ -773,7 +789,7 @@ static VkImageView CreateImageView(VkDevice Device, VkImage Image, VkFormat Form
 		},
 		.subresourceRange
 		{
-			.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+			.aspectMask = AspectFlags,
 			.baseMipLevel = 0,
 			.levelCount = 1,
 			.baseArrayLayer = 0,
@@ -838,7 +854,7 @@ static swap_chain CreateSwapChain(physical_device_deets* DeviceDeets,
 		Result.ImageViews = AllocArray(VkImageView, Result.NumImages);
 		for (u32 i = 0; i < Result.NumImages; i++)
 		{
-			Result.ImageViews[i] = CreateImageView(LogicalDevice, Result.Images[i], Result.Format);
+			Result.ImageViews[i] = CreateImageView(LogicalDevice, Result.Images[i], Result.Format, VK_IMAGE_ASPECT_COLOR_BIT);
 		}
 	}
 	else
@@ -849,7 +865,44 @@ static swap_chain CreateSwapChain(physical_device_deets* DeviceDeets,
 	return Result;
 }
 
-static VkRenderPass CreateRenderPass(VkDevice Device, swap_chain* Swapchain)
+static VkFormat FindSupportedFormat(VkFormat* Candidates, u32 NumCandidates, VkImageTiling Tiling, VkFormatFeatureFlags FeatureFlags, VkPhysicalDevice PhysicalDevice)
+{
+	VkFormat Result = VK_FORMAT_UNDEFINED;
+	for (u32 i = 0; i < NumCandidates; i++)
+	{
+		VkFormat Format = Candidates[i];
+
+		VkFormatProperties Props;
+		vkGetPhysicalDeviceFormatProperties(PhysicalDevice, Format, &Props);
+
+		if (Tiling == VK_IMAGE_TILING_LINEAR && (Props.linearTilingFeatures & FeatureFlags) == FeatureFlags)
+		{
+			Result = Format;
+			break;
+		}
+		else if (Tiling == VK_IMAGE_TILING_OPTIMAL && (Props.optimalTilingFeatures & FeatureFlags) == FeatureFlags)
+		{
+			Result = Format;
+			break;
+		}
+	}
+	if (Result == VK_FORMAT_UNDEFINED)
+	{
+		fprintf(stderr, "Sorry couldn't find supported format\n");
+		Assert(false);
+	}
+	return Result;
+}
+
+static VkFormat FindDepthFormat(VkPhysicalDevice PhysicalDevice)
+{
+	VkFormat CandidateFormats[] = { VK_FORMAT_D32_SFLOAT, VK_FORMAT_D32_SFLOAT_S8_UINT, VK_FORMAT_D24_UNORM_S8_UINT };
+	VkFormat Result = FindSupportedFormat(CandidateFormats, ArrayCount(CandidateFormats),
+										  VK_IMAGE_TILING_OPTIMAL, VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT, PhysicalDevice);
+	return Result;
+}
+
+static VkRenderPass CreateRenderPass(VkDevice Device, VkPhysicalDevice PhysicalDevice, swap_chain* Swapchain)
 {
 	VkAttachmentDescription ColourAttachment
 	{
@@ -867,11 +920,29 @@ static VkRenderPass CreateRenderPass(VkDevice Device, swap_chain* Swapchain)
 		.attachment = 0, // NOTE: This is the index of 'layout(location = 0)' in the fragment shader
 		.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
 	};
+
+	VkAttachmentDescription DepthAttachment
+	{
+		.format = FindDepthFormat(PhysicalDevice),
+		.samples = VK_SAMPLE_COUNT_1_BIT,
+		.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+		.storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+		.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+		.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+		.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+	};
+	VkAttachmentReference DepthAttachmentRef
+	{
+		.attachment = 1,
+		.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+	};
+
 	VkSubpassDescription Subpass
 	{
 		.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
 		.colorAttachmentCount = 1,
 		.pColorAttachments = &ColourAttachmentRef,
+		.pDepthStencilAttachment = &DepthAttachmentRef,
 	};
 
 	// TODO: I don't understand this at all... what's going on here??
@@ -879,17 +950,18 @@ static VkRenderPass CreateRenderPass(VkDevice Device, swap_chain* Swapchain)
 	{
 		.srcSubpass = VK_SUBPASS_EXTERNAL,
 		.dstSubpass = 0,
-		.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-		.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+		.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
+		.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
 		.srcAccessMask = 0,
-		.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+		.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
 	};
 
+	VkAttachmentDescription Attachments[] = { ColourAttachment, DepthAttachment };
 	VkRenderPassCreateInfo RenderPassInfo
 	{
 		.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
-		.attachmentCount = 1,
-		.pAttachments = &ColourAttachment,
+		.attachmentCount = ArrayCount(Attachments),
+		.pAttachments = Attachments,
 		.subpassCount = 1,
 		.pSubpasses = &Subpass,
 		.dependencyCount = 1,
@@ -960,14 +1032,14 @@ static vulkan_pipeline CreateGraphicsPipeline(VkDevice Device, swap_chain* Swapc
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
 		.stage = VK_SHADER_STAGE_VERTEX_BIT,
 		.module = VertShaderModule,
-		.pName = "main"
+		.pName = "main",
 	};
 	VkPipelineShaderStageCreateInfo FragShaderStageInfo
 	{
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
 		.stage = VK_SHADER_STAGE_FRAGMENT_BIT,
 		.module = FragShaderModule,
-		.pName = "main"
+		.pName = "main",
 	};
 	VkPipelineShaderStageCreateInfo ShaderStages[] = { VertShaderStageInfo, FragShaderStageInfo };
 
@@ -977,7 +1049,7 @@ static vulkan_pipeline CreateGraphicsPipeline(VkDevice Device, swap_chain* Swapc
 	{
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
 		.dynamicStateCount = ArrayCount(DYNAMIC_STATES),
-		.pDynamicStates = DYNAMIC_STATES
+		.pDynamicStates = DYNAMIC_STATES,
 	};
 
 	VkVertexInputBindingDescription BindingDesc = vertex::GetBindingDescription();
@@ -1005,12 +1077,12 @@ static vulkan_pipeline CreateGraphicsPipeline(VkDevice Device, swap_chain* Swapc
 		.width = (f32)Swapchain->Extents.width,
 		.height = (f32)Swapchain->Extents.height,
 		.minDepth = 0.0f,
-		.maxDepth = 1.0f
+		.maxDepth = 1.0f,
 	};
 	VkRect2D Scissor
 	{
 		.offset = { .x = 0, .y = 0 },
-		.extent = Swapchain->Extents
+		.extent = Swapchain->Extents,
 	};
 
 	VkPipelineViewportStateCreateInfo ViewportState
@@ -1050,6 +1122,16 @@ static vulkan_pipeline CreateGraphicsPipeline(VkDevice Device, swap_chain* Swapc
 		.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
 	};
 
+	VkPipelineDepthStencilStateCreateInfo DepthStencil
+	{
+		.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+		.depthTestEnable = VK_TRUE,
+		.depthWriteEnable = VK_TRUE,
+		.depthCompareOp = VK_COMPARE_OP_LESS,
+		.depthBoundsTestEnable = VK_FALSE,
+		.stencilTestEnable = VK_FALSE,
+	};
+
 	VkPipelineColorBlendStateCreateInfo GlobalColourBlend
 	{
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
@@ -1078,11 +1160,12 @@ static vulkan_pipeline CreateGraphicsPipeline(VkDevice Device, swap_chain* Swapc
 			.pViewportState = &ViewportState,
 			.pRasterizationState = &Rasteriser,
 			.pMultisampleState = &Multisampling,
+			.pDepthStencilState = &DepthStencil,
 			.pColorBlendState = &GlobalColourBlend,
 			.pDynamicState = &DynamicState,
 			.layout = Result.Layout,
 			.renderPass = RenderPass,
-			.subpass = 0
+			.subpass = 0,
 		};
 		if (vkCreateGraphicsPipelines(Device, VK_NULL_HANDLE, 1, &PipelineInfo, nullptr, &Result.Handle) != VK_SUCCESS) // pAllocator
 		{
@@ -1515,12 +1598,7 @@ struct image_spec
 	VkImageTiling Tiling;
 	VkImageUsageFlags UsageFlags;
 	VkMemoryPropertyFlags MemPropFlags;
-};
-
-struct image
-{
-	VkImage Image;
-	VkDeviceMemory Memory;
+	VkImageAspectFlags AspectFlags;
 };
 
 static image CreateImage(VkDevice Device, VkPhysicalDevice PhysicalDevice, image_spec Spec)
@@ -1554,6 +1632,8 @@ static image CreateImage(VkDevice Device, VkPhysicalDevice PhysicalDevice, image
 		if (vkAllocateMemory(Device, &AllocInfo, nullptr, &Result.Memory) == VK_SUCCESS) // pAllocator
 		{
 			vkBindImageMemory(Device, Result.Image, Result.Memory, 0);
+
+			Result.ImageView = CreateImageView(Device, Result.Image, Spec.Format, Spec.AspectFlags);
 		}
 		else
 		{
@@ -1566,6 +1646,25 @@ static image CreateImage(VkDevice Device, VkPhysicalDevice PhysicalDevice, image
 		fprintf(stderr, "Failed to create image\n");
 		Assert(false);
 	}
+	return Result;
+}
+
+static image CreateDepthBuffer(VkDevice Device, VkPhysicalDevice PhysicalDevice, swap_chain* Swapchain)
+{
+	VkFormat DepthFormat = FindDepthFormat(PhysicalDevice);
+	
+	image_spec Spec
+	{
+		.Width = Swapchain->Extents.width,
+		.Height = Swapchain->Extents.height,
+		.Format = DepthFormat,
+		.Tiling = VK_IMAGE_TILING_OPTIMAL,
+		.UsageFlags = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+		.MemPropFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+		.AspectFlags = VK_IMAGE_ASPECT_DEPTH_BIT,
+	};
+	image Result = CreateImage(Device, PhysicalDevice, Spec);
+
 	return Result;
 }
 
@@ -1597,6 +1696,7 @@ static image CreateTexture(VkDevice Device, VkPhysicalDevice PhysicalDevice, VkC
 			.Tiling = VK_IMAGE_TILING_OPTIMAL,
 			.UsageFlags = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
 			.MemPropFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+			.AspectFlags = VK_IMAGE_ASPECT_COLOR_BIT,
 		};
 		Result = CreateImage(Device, PhysicalDevice, Spec);
 
@@ -1676,8 +1776,9 @@ struct vulkan_stuff
 	void** UniformBufferPtrs;
 
 	image Texture;
-	VkImageView TextureImageView;
 	VkSampler TextureSampler;
+
+	image DepthImage;
 
 	VkDescriptorPool DescPool;
 	VkDescriptorSet* DescSets;
@@ -1730,8 +1831,12 @@ static void CreateSyncObjects(vulkan_stuff* OutVulkanStuff)
 	}
 }
 
-static void CleanUpSwapchain(VkDevice Device, swap_chain* Swapchain)
+static void CleanUpSwapchain(VkDevice Device, swap_chain* Swapchain, image DepthImage)
 {
+	vkDestroyImageView(Device, DepthImage.ImageView, nullptr); // pAllocator
+	vkDestroyImage(Device, DepthImage.Image, nullptr); // pAllocator
+	vkFreeMemory(Device, DepthImage.Memory, nullptr); // pAllocator
+
 	for (u32 i = 0; i < Swapchain->NumImages; i++)
 	{
 		vkDestroyFramebuffer(Device, Swapchain->Framebuffers[i], nullptr); // pAllocator
@@ -1771,11 +1876,12 @@ static void RecreateSwapchain(vulkan_stuff* VulkanStuff, GLFWwindow* Window)
 											  VulkanStuff->Surface,
 											  &VulkanStuff->PhysicalDevice.SwapChainDeets.Capabilities);
 	
-	CleanUpSwapchain(VulkanStuff->Device, &VulkanStuff->Swapchain);
+	CleanUpSwapchain(VulkanStuff->Device, &VulkanStuff->Swapchain, VulkanStuff->DepthImage);
 
 	VulkanStuff->Swapchain = CreateSwapChain(&VulkanStuff->PhysicalDevice, VulkanStuff->Device, Window, VulkanStuff->Surface);
+	VulkanStuff->DepthImage = CreateDepthBuffer(VulkanStuff->Device, VulkanStuff->PhysicalDevice.Handle, &VulkanStuff->Swapchain);
 
-	CreateFramebuffers(&VulkanStuff->Swapchain, VulkanStuff->Device, VulkanStuff->RenderPass);
+	CreateFramebuffers(&VulkanStuff->Swapchain, VulkanStuff->DepthImage, VulkanStuff->Device, VulkanStuff->RenderPass);
 }
 
 static vulkan_stuff InitVulkan(GLFWwindow* Window)
@@ -1788,20 +1894,20 @@ static vulkan_stuff InitVulkan(GLFWwindow* Window)
 	Result.Device = CreateLogicalDevice(Result.PhysicalDevice);
 	vkGetDeviceQueue(Result.Device, Result.PhysicalDevice.QueueFamilyIndices.GraphicsFamily, 0, &Result.GraphicsQueue);
 	Result.Swapchain = CreateSwapChain(&Result.PhysicalDevice, Result.Device, Window, Result.Surface);
-	Result.RenderPass = CreateRenderPass(Result.Device, &Result.Swapchain);
+	Result.RenderPass = CreateRenderPass(Result.Device, Result.PhysicalDevice.Handle, &Result.Swapchain);
 	Result.DescSetLayout = CreateDescriptorSetLayout(Result.Device);
 	Result.Pipeline = CreateGraphicsPipeline(Result.Device, &Result.Swapchain, Result.RenderPass, Result.DescSetLayout);
-	CreateFramebuffers(&Result.Swapchain, Result.Device, Result.RenderPass);
 	Result.CommandPool = CreateCommandPool(Result.Device, Result.PhysicalDevice.QueueFamilyIndices.GraphicsFamily);
+	Result.DepthImage = CreateDepthBuffer(Result.Device, Result.PhysicalDevice.Handle, &Result.Swapchain);
+	CreateFramebuffers(&Result.Swapchain, Result.DepthImage, Result.Device, Result.RenderPass);
 	Result.Texture = CreateTexture(Result.Device, Result.PhysicalDevice.Handle, Result.CommandPool, Result.GraphicsQueue);
-	Result.TextureImageView = CreateImageView(Result.Device, Result.Texture.Image, VK_FORMAT_R8G8B8A8_SRGB);
 	Result.TextureSampler = CreateTextureSampler(Result.Device, Result.PhysicalDevice.Handle);
 	Result.VertexBuffer = CreateVertexBuffer(Result.Device, Result.PhysicalDevice.Handle, Result.CommandPool, Result.GraphicsQueue);
 	Result.IndexBuffer = CreateIndexBuffer(Result.Device, Result.PhysicalDevice.Handle, Result.CommandPool, Result.GraphicsQueue);
 	Result.UniformBuffers = CreateUniformBuffers(Result.Device, Result.PhysicalDevice.Handle, &Result.UniformBufferPtrs);
 	Result.DescPool = CreateDescriptorPool(Result.Device);
 	Result.DescSets = CreateDescriptorSets(Result.Device, Result.DescSetLayout, Result.DescPool, Result.UniformBuffers, 
-										   Result.TextureImageView, Result.TextureSampler);
+										   Result.Texture.ImageView, Result.TextureSampler);
 	Result.CommandBuffers = CreateCommandBuffers(Result.Device, Result.CommandPool);
 	CreateSyncObjects(&Result);
 
@@ -1840,16 +1946,20 @@ static void RecordCommandBuffer(vulkan_stuff* VulkanStuff, u32 ImageIndex)
 	VkCommandBuffer CommandBuffer = VulkanStuff->CommandBuffers[VulkanStuff->CurrentFrame];
 	if (vkBeginCommandBuffer(CommandBuffer, &BeginInfo) == VK_SUCCESS)
 	{
-		VkClearValue ClearColour { .color = { 0.0f, 0.0f, 0.0f, 1.0f } };
 		Assert(ImageIndex < VulkanStuff->Swapchain.NumImages);
+		VkClearValue ClearValues[] 
+		{
+			{ .color = { 0.0f, 0.0f, 0.0f, 1.0f } },
+			{ .depthStencil = { .depth = 1.0f, .stencil = 0 } },
+		};
 		VkRenderPassBeginInfo RenderPassInfo
 		{
 			.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
 			.renderPass = VulkanStuff->RenderPass,
 			.framebuffer = VulkanStuff->Swapchain.Framebuffers[ImageIndex],
 			.renderArea = { .offset = {0, 0}, .extent = VulkanStuff->Swapchain.Extents },
-			.clearValueCount = 1,
-			.pClearValues = &ClearColour
+			.clearValueCount = ArrayCount(ClearValues),
+			.pClearValues = ClearValues,
 		};
 		vkCmdBeginRenderPass(CommandBuffer, &RenderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
 		vkCmdBindPipeline(CommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, VulkanStuff->Pipeline.Handle);
@@ -1989,9 +2099,9 @@ static void CleanUp(GLFWwindow* Window, vulkan_stuff* VulkanStuff)
 #if _DEBUG
 	DestroyDebugCallback(VulkanStuff->Instance);
 #endif
-	CleanUpSwapchain(VulkanStuff->Device, &VulkanStuff->Swapchain);
+	CleanUpSwapchain(VulkanStuff->Device, &VulkanStuff->Swapchain, VulkanStuff->DepthImage);
 	vkDestroySampler(VulkanStuff->Device, VulkanStuff->TextureSampler, nullptr); // pAllocator
-	vkDestroyImageView(VulkanStuff->Device, VulkanStuff->TextureImageView, nullptr); // pAllocator
+	vkDestroyImageView(VulkanStuff->Device, VulkanStuff->Texture.ImageView, nullptr); // pAllocator
 	vkDestroyImage(VulkanStuff->Device, VulkanStuff->Texture.Image, nullptr); // pAllocator
 	vkFreeMemory(VulkanStuff->Device, VulkanStuff->Texture.Memory, nullptr); // pAllocator
 
